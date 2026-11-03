@@ -2,24 +2,23 @@
  * RpiEthProbe - EXPERIMENTAL KMDF probe driver for the Raspberry Pi 5 RP1
  * Ethernet MAC (Cadence GEM), matched as ACPI\RPIE0001.
  *
- * Version 2. What it does:
+ * Version 3 (diagnostics). What it does:
  *   1. Maps the memory windows the firmware ACPI device exposes
  *      (resource 0 = GEM registers, 1 = ETH config block,
- *       2 = RP1 GPIO bank 1, optional: only present with the newer firmware).
+ *       2 = RP1 GPIO bank 1, present with the GPIO-window firmware patch).
  *   2. Reads the GEM module ID register (offset 0xFC).
- *   3. Scans all 32 MDIO addresses for a PHY (registers 2 and 3).
- *   4. If the GPIO window is present, pulses RP1 GPIO 32 (the Pi 5 PHY reset,
- *      active low) and scans again.
- *   5. Writes the results to the device's registry key so they can be read
- *      with regedit (no kernel debugger needed).
+ *   3. Reads register 2 of every MDIO address (0-31) in several states and
+ *      stores the raw values: before touching anything, with the PHY reset
+ *      pin driven high, driven low (reset asserted), and high again.
+ *   4. Reads back RP1 GPIO 32 STATUS/CTRL in each state, to see whether the
+ *      pin really moved.
+ *   5. Writes everything to the device's registry key (regedit, no debugger).
  *
- * What it does NOT do: bring up the Ethernet clocks or any data path. It is a
- * hardware reachability test only.
+ * What it does NOT do: bring up the Ethernet clocks or any data path.
  *
- * Version 1 results on a Pi 5: GEM module ID 0x00070163 (register access
- * works), MDIO transactions complete, but no PHY answered at address 1
- * (all-ones). The likely cause is the PHY being held in reset, which is what
- * step 4 tries to fix.
+ * Results so far (Pi 5): GEM module ID 0x00070163 (registers work), MDIO
+ * transactions complete, GPIO window mapped and reset pulsed, but no PHY
+ * answers at any address.
  *
  * Build: Visual Studio + WDK, platform ARM64, KMDF driver.
  */
@@ -52,6 +51,8 @@
 #define PHY_ADDR_DT     1         /* Pi 5 device tree: ethernet-phy@1 */
 #define PHY_NOT_FOUND   0xFFFFFFFFUL
 
+#define RAW_TIMEOUT     0xDEAD    /* sentinel stored when an MDIO read timed out */
+
 /*
  * RP1 GPIO (from Raspberry Pi Linux pinctrl-rp1.c). GPIO 32 is pin 4 of
  * bank 1 (GPIO 28-33). Per pin: STATUS at +8*n, CTRL at +8*n+4.
@@ -59,6 +60,7 @@
  *       OEOVER bits 15:14 (3 = output enabled).
  */
 #define GPIO_PHY_RESET_PIN_IN_BANK  4
+#define GPIO_STATUS_OFFSET(n)       ((n) * 8)
 #define GPIO_CTRL_OFFSET(n)         ((n) * 8 + 4)
 #define GPIO_FUNCSEL_NULL           0x1FUL
 #define GPIO_OUTOVER_LOW            (2UL << 12)
@@ -89,6 +91,27 @@ static ULONG GemRead(PDEVICE_CONTEXT C, ULONG Off)
 static VOID GemWrite(PDEVICE_CONTEXT C, ULONG Off, ULONG Val)
 {
     WRITE_REGISTER_ULONG((volatile ULONG *)(C->Gem + Off), Val);
+}
+
+static ULONG GpioStatusRead(PDEVICE_CONTEXT C)
+{
+    return READ_REGISTER_ULONG((volatile ULONG *)
+        (C->Gpio + GPIO_STATUS_OFFSET(GPIO_PHY_RESET_PIN_IN_BANK)));
+}
+
+static ULONG GpioCtrlRead(PDEVICE_CONTEXT C)
+{
+    return READ_REGISTER_ULONG((volatile ULONG *)
+        (C->Gpio + GPIO_CTRL_OFFSET(GPIO_PHY_RESET_PIN_IN_BANK)));
+}
+
+/* Drive GPIO 32 (PHY reset, active low) high = released, low = asserted. */
+static VOID GpioDrive(PDEVICE_CONTEXT C, BOOLEAN High)
+{
+    WRITE_REGISTER_ULONG(
+        (volatile ULONG *)(C->Gpio + GPIO_CTRL_OFFSET(GPIO_PHY_RESET_PIN_IN_BANK)),
+        GPIO_FUNCSEL_NULL | (High ? GPIO_OUTOVER_HIGH : GPIO_OUTOVER_LOW) |
+        GPIO_OEOVER_ENABLE);
 }
 
 static VOID MsDelay(ULONG Ms)
@@ -126,10 +149,35 @@ static NTSTATUS PhyRead(PDEVICE_CONTEXT C, ULONG Phy, ULONG Reg, PUSHORT Value)
     return STATUS_SUCCESS;
 }
 
+/* Read register 2 of all 32 MDIO addresses. Timeouts are stored as 0xDEAD. */
+static VOID ScanRaw(PDEVICE_CONTEXT C, USHORT Raw[32])
+{
+    ULONG Addr;
+    for (Addr = 0; Addr < 32; Addr++) {
+        USHORT R = 0;
+        if (!NT_SUCCESS(PhyRead(C, Addr, 2, &R))) {
+            R = RAW_TIMEOUT;
+        }
+        Raw[Addr] = R;
+    }
+}
+
+/* Summarise a raw scan: how many addresses read all-ones, zero, or something else. */
+static VOID CountRaw(const USHORT Raw[32], PULONG Ones, PULONG Zeros, PULONG Other)
+{
+    ULONG i;
+    *Ones = *Zeros = *Other = 0;
+    for (i = 0; i < 32; i++) {
+        if (Raw[i] == 0xFFFF)      (*Ones)++;
+        else if (Raw[i] == 0x0000) (*Zeros)++;
+        else                       (*Other)++;
+    }
+}
+
 /*
- * Scan MDIO addresses 0-31 for a PHY. Returns the first address whose ID
- * register 2 is neither 0x0000 nor 0xFFFF (nothing driving the bus reads as
- * all ones), or PHY_NOT_FOUND. Id2/Id3 receive that PHY's ID words.
+ * Find the first address whose ID register 2 is neither 0x0000 nor 0xFFFF
+ * (nothing driving the bus reads as all ones). Returns the address or
+ * PHY_NOT_FOUND; Id2/Id3 receive that PHY's ID words.
  */
 static ULONG PhyScan(PDEVICE_CONTEXT C, PUSHORT Id2, PUSHORT Id3)
 {
@@ -152,23 +200,15 @@ static ULONG PhyScan(PDEVICE_CONTEXT C, PUSHORT Id2, PUSHORT Id3)
     return PHY_NOT_FOUND;
 }
 
-/* Pulse the PHY reset line (RP1 GPIO 32, active low) and wait for it to boot. */
-static VOID PhyResetPulse(PDEVICE_CONTEXT C)
-{
-    volatile ULONG *Ctrl = (volatile ULONG *)
-        (C->Gpio + GPIO_CTRL_OFFSET(GPIO_PHY_RESET_PIN_IN_BANK));
-
-    WRITE_REGISTER_ULONG(Ctrl,
-        GPIO_FUNCSEL_NULL | GPIO_OUTOVER_LOW | GPIO_OEOVER_ENABLE);
-    MsDelay(20);                      /* Linux holds reset for 5 ms; be generous */
-    WRITE_REGISTER_ULONG(Ctrl,
-        GPIO_FUNCSEL_NULL | GPIO_OUTOVER_HIGH | GPIO_OEOVER_ENABLE);
-    MsDelay(200);                     /* let the PHY come out of reset */
-}
-
 static VOID SaveUlong(WDFKEY Key, PCUNICODE_STRING Name, ULONG Value)
 {
     (VOID)WdfRegistryAssignULong(Key, Name, Value);
+}
+
+/* Stores 32 USHORTs (64 bytes) as REG_BINARY; address 0 first, little endian. */
+static VOID SaveRaw(WDFKEY Key, PCUNICODE_STRING Name, USHORT Raw[32])
+{
+    (VOID)WdfRegistryAssignValue(Key, Name, REG_BINARY, 32 * sizeof(USHORT), Raw);
 }
 
 NTSTATUS
@@ -216,7 +256,14 @@ RpiEthEvtPrepareHardware(
     ULONG Mid;
     ULONG AddrBefore, AddrAfter;
     ULONG ResetDone = 0;
+    ULONG GpioCtrlBefore = 0, GpioCtrlAfter = 0;
+    ULONG GpioStatusBefore = 0, GpioStatusHigh1 = 0, GpioStatusLow = 0, GpioStatusHigh2 = 0;
+    ULONG Ones, Zeros, Other;
     ULONG DtAddrId2 = 0xFFFF, DtAddrId3 = 0xFFFF;
+    USHORT RawBefore[32] = {0};
+    USHORT RawHigh1[32]  = {0};
+    USHORT RawLow[32]    = {0};
+    USHORT RawAfter[32]  = {0};
 
     DECLARE_CONST_UNICODE_STRING(NameMid,        L"GemModuleId");
     DECLARE_CONST_UNICODE_STRING(NameNcr,        L"GemNcr");
@@ -232,6 +279,19 @@ RpiEthEvtPrepareHardware(
     DECLARE_CONST_UNICODE_STRING(NamePhy3,       L"PhyId2Reg3");
     DECLARE_CONST_UNICODE_STRING(NameDt2,        L"PhyAddr1Reg2");
     DECLARE_CONST_UNICODE_STRING(NameDt3,        L"PhyAddr1Reg3");
+    DECLARE_CONST_UNICODE_STRING(NameGCtrlB,     L"GpioCtrlBefore");
+    DECLARE_CONST_UNICODE_STRING(NameGCtrlA,     L"GpioCtrlAfter");
+    DECLARE_CONST_UNICODE_STRING(NameGStB,       L"GpioStatusBefore");
+    DECLARE_CONST_UNICODE_STRING(NameGStH1,      L"GpioStatusDrivenHigh");
+    DECLARE_CONST_UNICODE_STRING(NameGStL,       L"GpioStatusDrivenLow");
+    DECLARE_CONST_UNICODE_STRING(NameGStH2,      L"GpioStatusHighAgain");
+    DECLARE_CONST_UNICODE_STRING(NameRawB,       L"RawScanBefore");
+    DECLARE_CONST_UNICODE_STRING(NameRawH1,      L"RawScanDrivenHigh");
+    DECLARE_CONST_UNICODE_STRING(NameRawL,       L"RawScanDrivenLow");
+    DECLARE_CONST_UNICODE_STRING(NameRawA,       L"RawScanAfter");
+    DECLARE_CONST_UNICODE_STRING(NameOnes,       L"AfterScanAllOnes");
+    DECLARE_CONST_UNICODE_STRING(NameZeros,      L"AfterScanZeros");
+    DECLARE_CONST_UNICODE_STRING(NameOther,      L"AfterScanOther");
 
     UNREFERENCED_PARAMETER(ResourcesRaw);
 
@@ -285,17 +345,36 @@ RpiEthEvtPrepareHardware(
         GemWrite(Ctx, GEM_NCR, GemRead(Ctx, GEM_NCR) | NCR_MPE);
     }
 
-    /* 3. Scan for a PHY before touching its reset line. */
+    /* 3. Baseline scan, before touching the PHY reset line. */
+    ScanRaw(Ctx, RawBefore);
     AddrBefore = PhyScan(Ctx, &Id2Before, &Id3Before);
 
-    /* 4. Pulse the PHY reset if the firmware gave us the GPIO window. */
+    /* 4. Walk the reset pin through high, low, high; scan in each state. */
     if (Ctx->Gpio != NULL) {
-        PhyResetPulse(Ctx);
+        GpioCtrlBefore   = GpioCtrlRead(Ctx);
+        GpioStatusBefore = GpioStatusRead(Ctx);
+
+        GpioDrive(Ctx, TRUE);                 /* reset released */
+        MsDelay(300);
+        GpioStatusHigh1 = GpioStatusRead(Ctx);
+        ScanRaw(Ctx, RawHigh1);
+
+        GpioDrive(Ctx, FALSE);                /* reset asserted */
+        MsDelay(50);
+        GpioStatusLow = GpioStatusRead(Ctx);
+        ScanRaw(Ctx, RawLow);
+
+        GpioDrive(Ctx, TRUE);                 /* reset released again */
+        MsDelay(500);
+        GpioStatusHigh2 = GpioStatusRead(Ctx);
+        GpioCtrlAfter   = GpioCtrlRead(Ctx);
         ResetDone = 1;
     }
 
-    /* 5. Scan again, and also read the device-tree address (1) directly. */
+    /* 5. Final scan, and the device-tree address read directly. */
+    ScanRaw(Ctx, RawAfter);
     AddrAfter = PhyScan(Ctx, &Id2, &Id3);
+    CountRaw(RawAfter, &Ones, &Zeros, &Other);
     {
         USHORT R2 = 0xFFFF, R3 = 0xFFFF;
         (VOID)PhyRead(Ctx, PHY_ADDR_DT, 2, &R2);
@@ -319,6 +398,19 @@ RpiEthEvtPrepareHardware(
         SaveUlong(Key, &NamePhy3,       Id3);
         SaveUlong(Key, &NameDt2,        DtAddrId2);
         SaveUlong(Key, &NameDt3,        DtAddrId3);
+        SaveUlong(Key, &NameGCtrlB,     GpioCtrlBefore);
+        SaveUlong(Key, &NameGCtrlA,     GpioCtrlAfter);
+        SaveUlong(Key, &NameGStB,       GpioStatusBefore);
+        SaveUlong(Key, &NameGStH1,      GpioStatusHigh1);
+        SaveUlong(Key, &NameGStL,       GpioStatusLow);
+        SaveUlong(Key, &NameGStH2,      GpioStatusHigh2);
+        SaveUlong(Key, &NameOnes,       Ones);
+        SaveUlong(Key, &NameZeros,      Zeros);
+        SaveUlong(Key, &NameOther,      Other);
+        SaveRaw(Key, &NameRawB,  RawBefore);
+        SaveRaw(Key, &NameRawH1, RawHigh1);
+        SaveRaw(Key, &NameRawL,  RawLow);
+        SaveRaw(Key, &NameRawA,  RawAfter);
         WdfRegistryClose(Key);
     }
 
