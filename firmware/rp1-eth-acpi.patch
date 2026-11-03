@@ -16,10 +16,10 @@ index aed8ae8..a4294ec 100644
  
  STATIC
 diff --git a/Silicon/RaspberryPi/RpiSiliconPkg/Include/Rp1.asi b/Silicon/RaspberryPi/RpiSiliconPkg/Include/Rp1.asi
-index 9de562b..ce0c399 100644
+index 9de562b..9f7de41 100644
 --- a/Silicon/RaspberryPi/RpiSiliconPkg/Include/Rp1.asi
 +++ b/Silicon/RaspberryPi/RpiSiliconPkg/Include/Rp1.asi
-@@ -58,3 +58,42 @@ Device (XHC1) {
+@@ -58,3 +58,48 @@ Device (XHC1) {
      Return (RBUF)
    }
  }
@@ -35,7 +35,9 @@ index 9de562b..ce0c399 100644
 +// Resource 1: Ethernet config window  (RP1_ETH_CFG_BASE, size assumed)
 +// Resource 2: RP1 GPIO bank 1 registers (RP1_IO_BANK1_BASE). GPIO 32 drives
 +//             the PHY reset on the Pi 5, so the driver needs this window.
-+// Resource 3: shared RP1 level interrupt (RP1_INT_ETH is routed to PINT)
++// Resource 3: Ethernet pad block (RP1_PADS_ETH_BASE), MDIO/MDC/RGMII pads
++// Resource 4: RP1 main clock block (RP1_CLOCKS_MAIN_BASE), clk_eth at +0x64
++// Resource 5: shared RP1 level interrupt (RP1_INT_ETH is routed to PINT)
 +//
 +// NOTE: this only makes the device visible. Clocks, reset and PHY bring-up
 +// are NOT done by firmware yet, so the MAC will not pass traffic.
@@ -53,20 +55,24 @@ index 9de562b..ce0c399 100644
 +      RP1_QWORDMEMORY_BUF (00)
 +      RP1_QWORDMEMORY_BUF (01)
 +      RP1_QWORDMEMORY_BUF (02)
-+      RP1_INTERRUPT_BUF (03)
++      RP1_QWORDMEMORY_BUF (03)
++      RP1_QWORDMEMORY_BUF (04)
++      RP1_INTERRUPT_BUF (05)
 +    })
 +    RP1_QWORDMEMORY_SET (00, RP1_ETH_BASE, RP1_ETH_SIZE)
 +    RP1_QWORDMEMORY_SET (01, RP1_ETH_CFG_BASE, RP1_ETH_CFG_SIZE)
 +    RP1_QWORDMEMORY_SET (02, RP1_IO_BANK1_BASE, RP1_IO_BANK1_SIZE)
-+    RP1_INTERRUPT_SET (03)
++    RP1_QWORDMEMORY_SET (03, RP1_PADS_ETH_BASE, RP1_PADS_ETH_SIZE)
++    RP1_QWORDMEMORY_SET (04, RP1_CLOCKS_MAIN_BASE, RP1_CLOCKS_MAIN_SIZE)
++    RP1_INTERRUPT_SET (05)
 +    Return (RBUF)
 +  }
 +}
 diff --git a/Silicon/RaspberryPi/RpiSiliconPkg/Include/Rp1.h b/Silicon/RaspberryPi/RpiSiliconPkg/Include/Rp1.h
-index d136c51..fc5d4b1 100644
+index d136c51..455a13c 100644
 --- a/Silicon/RaspberryPi/RpiSiliconPkg/Include/Rp1.h
 +++ b/Silicon/RaspberryPi/RpiSiliconPkg/Include/Rp1.h
-@@ -109,6 +109,21 @@
+@@ -109,6 +109,29 @@
  
  #define RP1_USBHOST_SIZE                            0x00100000
  
@@ -84,6 +90,14 @@ index d136c51..fc5d4b1 100644
 +// Pi 5 Ethernet PHY reset) is pin 4 of this bank, so its CTRL is at +0x24.
 +//
 +#define RP1_IO_BANK1_SIZE                           0x00004000
++
++//
++// Ethernet pad block (RP1_PADS_ETH_BASE) and the main clock block
++// (RP1_CLOCKS_MAIN_BASE, which holds clk_eth at +0x64 and clk_eth_tsu at
++// +0x134). One 16K RP1 block each.
++//
++#define RP1_PADS_ETH_SIZE                           0x00004000
++#define RP1_CLOCKS_MAIN_SIZE                        0x00004000
 +
  //
  // Local MSI-X vectors

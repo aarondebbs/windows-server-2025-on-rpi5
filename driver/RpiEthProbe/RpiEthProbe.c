@@ -2,6 +2,9 @@
  * RpiEthProbe - EXPERIMENTAL KMDF probe driver for the Raspberry Pi 5 RP1
  * Ethernet MAC (Cadence GEM), matched as ACPI\RPIE0001.
  *
+ * Version 4 (diagnostics + pads/clock). v3 steps below, plus: maps the ETH pad
+ * block and RP1 clock block, dumps them, enables clk_eth if it is off, enables
+ * the pad inputs, and rescans MDIO after each.
  * Version 3 (diagnostics). What it does:
  *   1. Maps the memory windows the firmware ACPI device exposes
  *      (resource 0 = GEM registers, 1 = ETH config block,
@@ -67,6 +70,20 @@
 #define GPIO_OUTOVER_HIGH           (3UL << 12)
 #define GPIO_OEOVER_ENABLE          (3UL << 14)
 
+/* RP1 main clock block: clk_eth and clk_eth_tsu. CTRL bit 11 = enable. */
+#define CLK_ETH_CTRL        0x064
+#define CLK_ETH_DIV         0x068
+#define CLK_ETH_SEL         0x070
+#define CLK_ETH_TSU_CTRL    0x134
+#define CLK_ETH_TSU_DIV     0x138
+#define CLK_ETH_TSU_SEL     0x140
+#define CLK_CTRL_ENABLE     (1UL << 11)
+
+/* ETH pad block: dword 0 is the voltage select, dwords 1.. are per-pad. */
+#define PADS_DWORDS         16
+#define PAD_IE              (1UL << 6)   /* input enable   */
+#define PAD_OD              (1UL << 7)   /* output disable */
+
 typedef struct _DEVICE_CONTEXT {
     PUCHAR  Gem;
     SIZE_T  GemLen;
@@ -74,6 +91,10 @@ typedef struct _DEVICE_CONTEXT {
     SIZE_T  CfgLen;
     PUCHAR  Gpio;
     SIZE_T  GpioLen;
+    PUCHAR  Pads;
+    SIZE_T  PadsLen;
+    PUCHAR  Clk;
+    SIZE_T  ClkLen;
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, GetDeviceContext)
@@ -91,6 +112,24 @@ static ULONG GemRead(PDEVICE_CONTEXT C, ULONG Off)
 static VOID GemWrite(PDEVICE_CONTEXT C, ULONG Off, ULONG Val)
 {
     WRITE_REGISTER_ULONG((volatile ULONG *)(C->Gem + Off), Val);
+}
+
+static ULONG RegRd(PUCHAR Base, ULONG Off)
+{
+    return READ_REGISTER_ULONG((volatile ULONG *)(Base + Off));
+}
+
+static VOID RegWr(PUCHAR Base, ULONG Off, ULONG Val)
+{
+    WRITE_REGISTER_ULONG((volatile ULONG *)(Base + Off), Val);
+}
+
+static VOID DumpPads(PDEVICE_CONTEXT C, ULONG Out[PADS_DWORDS])
+{
+    ULONG i;
+    for (i = 0; i < PADS_DWORDS; i++) {
+        Out[i] = RegRd(C->Pads, i * 4);
+    }
 }
 
 static ULONG GpioStatusRead(PDEVICE_CONTEXT C)
@@ -264,6 +303,16 @@ RpiEthEvtPrepareHardware(
     USHORT RawHigh1[32]  = {0};
     USHORT RawLow[32]    = {0};
     USHORT RawAfter[32]  = {0};
+    USHORT RawClk[32]    = {0};
+    USHORT RawPads[32]   = {0};
+    ULONG  PadsBefore[PADS_DWORDS] = {0};
+    ULONG  PadsAfter[PADS_DWORDS]  = {0};
+    ULONG  ClkB[6] = {0};          /* eth ctrl,div,sel ; tsu ctrl,div,sel */
+    ULONG  ClkA[6] = {0};
+    ULONG  ClkMapped = 0, PadsMapped = 0, ClkEnabledByUs = 0;
+    ULONG  ClkOnes = 0, ClkZeros = 0, ClkOther = 0;
+    ULONG  PadOnes = 0, PadZeros = 0, PadOther = 0;
+    ULONG  AddrClk = PHY_NOT_FOUND, AddrPads = PHY_NOT_FOUND;
 
     DECLARE_CONST_UNICODE_STRING(NameMid,        L"GemModuleId");
     DECLARE_CONST_UNICODE_STRING(NameNcr,        L"GemNcr");
@@ -289,6 +338,19 @@ RpiEthEvtPrepareHardware(
     DECLARE_CONST_UNICODE_STRING(NameRawH1,      L"RawScanDrivenHigh");
     DECLARE_CONST_UNICODE_STRING(NameRawL,       L"RawScanDrivenLow");
     DECLARE_CONST_UNICODE_STRING(NameRawA,       L"RawScanAfter");
+    DECLARE_CONST_UNICODE_STRING(NamePadsM,      L"PadsMapped");
+    DECLARE_CONST_UNICODE_STRING(NameClkM,       L"ClkMapped");
+    DECLARE_CONST_UNICODE_STRING(NamePadsB,      L"PadsDumpBefore");
+    DECLARE_CONST_UNICODE_STRING(NamePadsA,      L"PadsDumpAfter");
+    DECLARE_CONST_UNICODE_STRING(NameClkBn,      L"ClkDumpBefore");
+    DECLARE_CONST_UNICODE_STRING(NameClkAn,      L"ClkDumpAfter");
+    DECLARE_CONST_UNICODE_STRING(NameClkEn,      L"ClkEthEnabledByDriver");
+    DECLARE_CONST_UNICODE_STRING(NameRawClk,     L"RawScanAfterClk");
+    DECLARE_CONST_UNICODE_STRING(NameRawPads,    L"RawScanAfterPads");
+    DECLARE_CONST_UNICODE_STRING(NameAddrClk,    L"PhyAddrAfterClk");
+    DECLARE_CONST_UNICODE_STRING(NameAddrPads,   L"PhyAddrAfterPads");
+    DECLARE_CONST_UNICODE_STRING(NameClkOnes,    L"AfterClkScanAllOnes");
+    DECLARE_CONST_UNICODE_STRING(NamePadOnes,    L"AfterPadsScanAllOnes");
     DECLARE_CONST_UNICODE_STRING(NameOnes,       L"AfterScanAllOnes");
     DECLARE_CONST_UNICODE_STRING(NameZeros,      L"AfterScanZeros");
     DECLARE_CONST_UNICODE_STRING(NameOther,      L"AfterScanOther");
@@ -316,6 +378,12 @@ RpiEthEvtPrepareHardware(
             } else if (MemIndex == 2) {
                 Ctx->Gpio = (PUCHAR)Va;
                 Ctx->GpioLen = D->u.Memory.Length;
+            } else if (MemIndex == 3) {
+                Ctx->Pads = (PUCHAR)Va;
+                Ctx->PadsLen = D->u.Memory.Length;
+            } else if (MemIndex == 4) {
+                Ctx->Clk = (PUCHAR)Va;
+                Ctx->ClkLen = D->u.Memory.Length;
             } else {
                 MmUnmapIoSpace(Va, D->u.Memory.Length);
             }
@@ -371,6 +439,54 @@ RpiEthEvtPrepareHardware(
         ResetDone = 1;
     }
 
+    /* 4b. Clock block: dump clk_eth / clk_eth_tsu; enable clk_eth if it is
+     *     off and has a divider programmed (never write if DIV is 0). */
+    if (Ctx->Clk != NULL) {
+        ClkMapped = 1;
+        ClkB[0] = RegRd(Ctx->Clk, CLK_ETH_CTRL);
+        ClkB[1] = RegRd(Ctx->Clk, CLK_ETH_DIV);
+        ClkB[2] = RegRd(Ctx->Clk, CLK_ETH_SEL);
+        ClkB[3] = RegRd(Ctx->Clk, CLK_ETH_TSU_CTRL);
+        ClkB[4] = RegRd(Ctx->Clk, CLK_ETH_TSU_DIV);
+        ClkB[5] = RegRd(Ctx->Clk, CLK_ETH_TSU_SEL);
+
+        if (!(ClkB[0] & CLK_CTRL_ENABLE) && ClkB[1] != 0) {
+            RegWr(Ctx->Clk, CLK_ETH_CTRL, ClkB[0] | CLK_CTRL_ENABLE);
+            ClkEnabledByUs = 1;
+        }
+        if (!(ClkB[3] & CLK_CTRL_ENABLE) && ClkB[4] != 0) {
+            RegWr(Ctx->Clk, CLK_ETH_TSU_CTRL, ClkB[3] | CLK_CTRL_ENABLE);
+            ClkEnabledByUs |= 2;
+        }
+        MsDelay(50);
+        ClkA[0] = RegRd(Ctx->Clk, CLK_ETH_CTRL);
+        ClkA[1] = RegRd(Ctx->Clk, CLK_ETH_DIV);
+        ClkA[2] = RegRd(Ctx->Clk, CLK_ETH_SEL);
+        ClkA[3] = RegRd(Ctx->Clk, CLK_ETH_TSU_CTRL);
+        ClkA[4] = RegRd(Ctx->Clk, CLK_ETH_TSU_DIV);
+        ClkA[5] = RegRd(Ctx->Clk, CLK_ETH_TSU_SEL);
+    }
+    ScanRaw(Ctx, RawClk);
+    AddrClk = PhyScan(Ctx, &Id2, &Id3);
+    CountRaw(RawClk, &ClkOnes, &ClkZeros, &ClkOther);
+
+    /* 4c. Pad block: dump, then enable input and output on every pad
+     *     (set IE, clear OD) so MDC/MDIO can reach the PHY. */
+    if (Ctx->Pads != NULL) {
+        ULONG p;
+        PadsMapped = 1;
+        DumpPads(Ctx, PadsBefore);
+        for (p = 1; p < PADS_DWORDS; p++) {
+            ULONG V = PadsBefore[p];
+            RegWr(Ctx->Pads, p * 4, (V | PAD_IE) & ~PAD_OD);
+        }
+        MsDelay(50);
+        DumpPads(Ctx, PadsAfter);
+    }
+    ScanRaw(Ctx, RawPads);
+    AddrPads = PhyScan(Ctx, &Id2, &Id3);
+    CountRaw(RawPads, &PadOnes, &PadZeros, &PadOther);
+
     /* 5. Final scan, and the device-tree address read directly. */
     ScanRaw(Ctx, RawAfter);
     AddrAfter = PhyScan(Ctx, &Id2, &Id3);
@@ -407,6 +523,19 @@ RpiEthEvtPrepareHardware(
         SaveUlong(Key, &NameOnes,       Ones);
         SaveUlong(Key, &NameZeros,      Zeros);
         SaveUlong(Key, &NameOther,      Other);
+        SaveUlong(Key, &NamePadsM, PadsMapped);
+        SaveUlong(Key, &NameClkM,  ClkMapped);
+        SaveUlong(Key, &NameClkEn, ClkEnabledByUs);
+        SaveUlong(Key, &NameAddrClk,  AddrClk);
+        SaveUlong(Key, &NameAddrPads, AddrPads);
+        SaveUlong(Key, &NameClkOnes,  ClkOnes);
+        SaveUlong(Key, &NamePadOnes,  PadOnes);
+        (VOID)WdfRegistryAssignValue(Key, &NamePadsB, REG_BINARY, sizeof(PadsBefore), PadsBefore);
+        (VOID)WdfRegistryAssignValue(Key, &NamePadsA, REG_BINARY, sizeof(PadsAfter), PadsAfter);
+        (VOID)WdfRegistryAssignValue(Key, &NameClkBn, REG_BINARY, sizeof(ClkB), ClkB);
+        (VOID)WdfRegistryAssignValue(Key, &NameClkAn, REG_BINARY, sizeof(ClkA), ClkA);
+        SaveRaw(Key, &NameRawClk,  RawClk);
+        SaveRaw(Key, &NameRawPads, RawPads);
         SaveRaw(Key, &NameRawB,  RawBefore);
         SaveRaw(Key, &NameRawH1, RawHigh1);
         SaveRaw(Key, &NameRawL,  RawLow);
@@ -436,6 +565,14 @@ RpiEthEvtReleaseHardware(_In_ WDFDEVICE Device, _In_ WDFCMRESLIST ResourcesTrans
     if (Ctx->Gpio != NULL) {
         MmUnmapIoSpace(Ctx->Gpio, Ctx->GpioLen);
         Ctx->Gpio = NULL;
+    }
+    if (Ctx->Pads != NULL) {
+        MmUnmapIoSpace(Ctx->Pads, Ctx->PadsLen);
+        Ctx->Pads = NULL;
+    }
+    if (Ctx->Clk != NULL) {
+        MmUnmapIoSpace(Ctx->Clk, Ctx->ClkLen);
+        Ctx->Clk = NULL;
     }
     return STATUS_SUCCESS;
 }
