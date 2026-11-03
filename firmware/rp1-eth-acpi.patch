@@ -69,10 +69,10 @@ index 9de562b..9f7de41 100644
 +  }
 +}
 diff --git a/Silicon/RaspberryPi/RpiSiliconPkg/Include/Rp1.h b/Silicon/RaspberryPi/RpiSiliconPkg/Include/Rp1.h
-index d136c51..455a13c 100644
+index d136c51..72487d4 100644
 --- a/Silicon/RaspberryPi/RpiSiliconPkg/Include/Rp1.h
 +++ b/Silicon/RaspberryPi/RpiSiliconPkg/Include/Rp1.h
-@@ -109,6 +109,29 @@
+@@ -109,6 +109,31 @@
  
  #define RP1_USBHOST_SIZE                            0x00100000
  
@@ -85,11 +85,13 @@ index d136c51..455a13c 100644
 +#define RP1_ETH_CFG_SIZE                            0x00004000
 +
 +//
-+// RP1 GPIO bank 1 (GPIO 28-33) register window. Each bank is one 16K block;
++// RP1 GPIO bank 1 (GPIO 28-33) register window. The size is widened to reach
++// pads bank 1 (0xf4000), because the GPIO 32 pad (+0x14 there) can disable its
++// output. Each bank is one 16K block;
 +// per pin there is a STATUS and a CTRL register, 8 bytes apart. GPIO 32 (the
 +// Pi 5 Ethernet PHY reset) is pin 4 of this bank, so its CTRL is at +0x24.
 +//
-+#define RP1_IO_BANK1_SIZE                           0x00004000
++#define RP1_IO_BANK1_SIZE                           0x00024000
 +
 +//
 +// Ethernet pad block (RP1_PADS_ETH_BASE) and the main clock block

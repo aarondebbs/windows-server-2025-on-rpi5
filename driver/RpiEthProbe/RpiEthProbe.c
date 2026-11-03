@@ -70,6 +70,17 @@
 #define GPIO_OUTOVER_HIGH           (3UL << 12)
 #define GPIO_OEOVER_ENABLE          (3UL << 14)
 
+/*
+ * The GPIO window now spans IO bank 1 (0xd4000) through pads bank 1 (0xf4000),
+ * so pad registers are reachable. GPIO 32 pad = pads bank 1 base + 4 + 4*4.
+ */
+#define GPIO_WIN_PADS_BANK1     0x20000
+#define GPIO32_PAD_OFFSET       (GPIO_WIN_PADS_BANK1 + 0x04 + 4 * GPIO_PHY_RESET_PIN_IN_BANK)
+#define GPIO_PAD_OD             (1UL << 7)   /* output disable */
+#define GPIO_PAD_IE             (1UL << 6)   /* input enable   */
+#define GPIO_STATUS_PAD_LOW     (1UL << 22)  /* raw pad input low  event/level */
+#define GPIO_STATUS_PAD_HIGH    (1UL << 23)  /* raw pad input high event/level */
+
 /* RP1 main clock block: clk_eth and clk_eth_tsu. CTRL bit 11 = enable. */
 #define CLK_ETH_CTRL        0x064
 #define CLK_ETH_DIV         0x068
@@ -298,6 +309,10 @@ RpiEthEvtPrepareHardware(
     ULONG GpioCtrlBefore = 0, GpioCtrlAfter = 0;
     ULONG GpioStatusBefore = 0, GpioStatusHigh1 = 0, GpioStatusLow = 0, GpioStatusHigh2 = 0;
     ULONG Ones, Zeros, Other;
+    ULONG PadBefore = 0, PadAfter = 0, PadMapped = 0;
+    USHORT RawPadFix[32] = {0};
+    ULONG AddrPadFix = PHY_NOT_FOUND, PadFixOnes = 0, PadFixZ = 0, PadFixO = 0;
+    ULONG StAfterFix = 0;
     ULONG DtAddrId2 = 0xFFFF, DtAddrId3 = 0xFFFF;
     USHORT RawBefore[32] = {0};
     USHORT RawHigh1[32]  = {0};
@@ -338,6 +353,13 @@ RpiEthEvtPrepareHardware(
     DECLARE_CONST_UNICODE_STRING(NameRawH1,      L"RawScanDrivenHigh");
     DECLARE_CONST_UNICODE_STRING(NameRawL,       L"RawScanDrivenLow");
     DECLARE_CONST_UNICODE_STRING(NameRawA,       L"RawScanAfter");
+    DECLARE_CONST_UNICODE_STRING(NameG32PadB,    L"Gpio32PadBefore");
+    DECLARE_CONST_UNICODE_STRING(NameG32PadA,    L"Gpio32PadAfter");
+    DECLARE_CONST_UNICODE_STRING(NameG32PadM,    L"Gpio32PadMapped");
+    DECLARE_CONST_UNICODE_STRING(NameG32St,      L"GpioStatusAfterPadFix");
+    DECLARE_CONST_UNICODE_STRING(NameRawFix,     L"RawScanAfterPadFix");
+    DECLARE_CONST_UNICODE_STRING(NameAddrFix,    L"PhyAddrAfterPadFix");
+    DECLARE_CONST_UNICODE_STRING(NameFixOnes,    L"AfterPadFixScanAllOnes");
     DECLARE_CONST_UNICODE_STRING(NamePadsM,      L"PadsMapped");
     DECLARE_CONST_UNICODE_STRING(NameClkM,       L"ClkMapped");
     DECLARE_CONST_UNICODE_STRING(NamePadsB,      L"PadsDumpBefore");
@@ -439,6 +461,24 @@ RpiEthEvtPrepareHardware(
         ResetDone = 1;
     }
 
+    /* 4a. GPIO 32 pad. Linux input status shows the pin reading LOW even
+     *     while driven high, so check the pad: clear output-disable, set
+     *     input-enable, drive high, hold, rescan. */
+    if (Ctx->Gpio != NULL && Ctx->GpioLen > GPIO32_PAD_OFFSET + 4) {
+        PadMapped = 1;
+        PadBefore = RegRd(Ctx->Gpio, GPIO32_PAD_OFFSET);
+        RegWr(Ctx->Gpio, GPIO32_PAD_OFFSET, (PadBefore & ~GPIO_PAD_OD) | GPIO_PAD_IE);
+        GpioDrive(Ctx, FALSE);
+        MsDelay(50);
+        GpioDrive(Ctx, TRUE);
+        MsDelay(300);
+        PadAfter = RegRd(Ctx->Gpio, GPIO32_PAD_OFFSET);
+        StAfterFix = GpioStatusRead(Ctx);
+        ScanRaw(Ctx, RawPadFix);
+        AddrPadFix = PhyScan(Ctx, &Id2, &Id3);
+        CountRaw(RawPadFix, &PadFixOnes, &PadFixZ, &PadFixO);
+    }
+
     /* 4b. Clock block: dump clk_eth / clk_eth_tsu; enable clk_eth if it is
      *     off and has a divider programmed (never write if DIV is 0). */
     if (Ctx->Clk != NULL) {
@@ -523,6 +563,13 @@ RpiEthEvtPrepareHardware(
         SaveUlong(Key, &NameOnes,       Ones);
         SaveUlong(Key, &NameZeros,      Zeros);
         SaveUlong(Key, &NameOther,      Other);
+        SaveUlong(Key, &NameG32PadM, PadMapped);
+        SaveUlong(Key, &NameG32PadB, PadBefore);
+        SaveUlong(Key, &NameG32PadA, PadAfter);
+        SaveUlong(Key, &NameG32St,   StAfterFix);
+        SaveUlong(Key, &NameAddrFix, AddrPadFix);
+        SaveUlong(Key, &NameFixOnes, PadFixOnes);
+        SaveRaw(Key, &NameRawFix, RawPadFix);
         SaveUlong(Key, &NamePadsM, PadsMapped);
         SaveUlong(Key, &NameClkM,  ClkMapped);
         SaveUlong(Key, &NameClkEn, ClkEnabledByUs);
