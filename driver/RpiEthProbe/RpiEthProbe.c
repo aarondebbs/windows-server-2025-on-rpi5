@@ -187,8 +187,8 @@ RpiEthEvtPrepareHardware(
         return STATUS_DEVICE_CONFIGURATION_ERROR;
     }
 
-    Status = WdfDeviceOpenRegKey(Device, PLUGPLAY_REGKEY_DEVICE,
-                                 KEY_SET_VALUE, WDF_NO_OBJECT_ATTRIBUTES, &Key);
+    Status = WdfDeviceOpenRegistryKey(Device, PLUGPLAY_REGKEY_DEVICE,
+                                      KEY_SET_VALUE, WDF_NO_OBJECT_ATTRIBUTES, &Key);
     if (!NT_SUCCESS(Status)) {
         /* Keep going: the probe still has value even if we can't record it. */
         Key = NULL;
