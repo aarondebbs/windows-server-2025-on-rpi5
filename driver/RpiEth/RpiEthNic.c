@@ -16,6 +16,7 @@
 #include <ntddk.h>
 #include <wdf.h>
 #include <netadaptercx.h>
+#include <net/logicaladdress.h>   /* NET_FRAGMENT_LOGICAL_ADDRESS (not pulled in by netadaptercx.h) */
 
 #define NIC_TAG 'ciNR'
 
