@@ -16,10 +16,10 @@ index aed8ae8..a4294ec 100644
  
  STATIC
 diff --git a/Silicon/RaspberryPi/RpiSiliconPkg/Include/Rp1.asi b/Silicon/RaspberryPi/RpiSiliconPkg/Include/Rp1.asi
-index 9de562b..ab091d1 100644
+index 9de562b..ce0c399 100644
 --- a/Silicon/RaspberryPi/RpiSiliconPkg/Include/Rp1.asi
 +++ b/Silicon/RaspberryPi/RpiSiliconPkg/Include/Rp1.asi
-@@ -58,3 +58,38 @@ Device (XHC1) {
+@@ -58,3 +58,42 @@ Device (XHC1) {
      Return (RBUF)
    }
  }
@@ -33,7 +33,9 @@ index 9de562b..ab091d1 100644
 +//
 +// Resource 0: GEM register window     (RP1_ETH_BASE)
 +// Resource 1: Ethernet config window  (RP1_ETH_CFG_BASE, size assumed)
-+// Resource 2: shared RP1 level interrupt (RP1_INT_ETH is routed to PINT)
++// Resource 2: RP1 GPIO bank 1 registers (RP1_IO_BANK1_BASE). GPIO 32 drives
++//             the PHY reset on the Pi 5, so the driver needs this window.
++// Resource 3: shared RP1 level interrupt (RP1_INT_ETH is routed to PINT)
 +//
 +// NOTE: this only makes the device visible. Clocks, reset and PHY bring-up
 +// are NOT done by firmware yet, so the MAC will not pass traffic.
@@ -50,19 +52,21 @@ index 9de562b..ab091d1 100644
 +    Name (RBUF, ResourceTemplate () {
 +      RP1_QWORDMEMORY_BUF (00)
 +      RP1_QWORDMEMORY_BUF (01)
-+      RP1_INTERRUPT_BUF (02)
++      RP1_QWORDMEMORY_BUF (02)
++      RP1_INTERRUPT_BUF (03)
 +    })
 +    RP1_QWORDMEMORY_SET (00, RP1_ETH_BASE, RP1_ETH_SIZE)
 +    RP1_QWORDMEMORY_SET (01, RP1_ETH_CFG_BASE, RP1_ETH_CFG_SIZE)
-+    RP1_INTERRUPT_SET (02)
++    RP1_QWORDMEMORY_SET (02, RP1_IO_BANK1_BASE, RP1_IO_BANK1_SIZE)
++    RP1_INTERRUPT_SET (03)
 +    Return (RBUF)
 +  }
 +}
 diff --git a/Silicon/RaspberryPi/RpiSiliconPkg/Include/Rp1.h b/Silicon/RaspberryPi/RpiSiliconPkg/Include/Rp1.h
-index d136c51..1d309cc 100644
+index d136c51..fc5d4b1 100644
 --- a/Silicon/RaspberryPi/RpiSiliconPkg/Include/Rp1.h
 +++ b/Silicon/RaspberryPi/RpiSiliconPkg/Include/Rp1.h
-@@ -109,6 +109,14 @@
+@@ -109,6 +109,21 @@
  
  #define RP1_USBHOST_SIZE                            0x00100000
  
@@ -73,6 +77,13 @@ index d136c51..1d309cc 100644
 +//
 +#define RP1_ETH_SIZE                                0x00004000
 +#define RP1_ETH_CFG_SIZE                            0x00004000
++
++//
++// RP1 GPIO bank 1 (GPIO 28-33) register window. Each bank is one 16K block;
++// per pin there is a STATUS and a CTRL register, 8 bytes apart. GPIO 32 (the
++// Pi 5 Ethernet PHY reset) is pin 4 of this bank, so its CTRL is at +0x24.
++//
++#define RP1_IO_BANK1_SIZE                           0x00004000
 +
  //
  // Local MSI-X vectors

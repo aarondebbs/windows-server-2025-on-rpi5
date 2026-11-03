@@ -28,17 +28,30 @@ Windows will not load an unsigned kernel driver on ARM64.
 ## Read the result
 regedit -> HKLM\SYSTEM\CurrentControlSet\Enum\ACPI\RPIE0001\<instance>\Device Parameters
 
+Driver v2 values (v1 only had MemResourcesMapped, GemModuleId, PhyReadStatus and the PhyId pair):
+
 | Value                | Meaning                                                      |
 |----------------------|--------------------------------------------------------------|
-| MemResourcesMapped   | should be 2 (GEM window + config window)                     |
-| GemModuleId          | 0x00000000 or 0xFFFFFFFF = block not clocked/not reachable   |
-|                      | anything else = a live GEM (IDNUM in bits 27:16)             |
-| PhyReadStatus        | 0 = MDIO worked, 0xC00000B5 = timeout                        |
-| PhyId1Reg2/PhyId2Reg3| PHY identifier words; 0 or 0xFFFF = no PHY answering         |
+| MemResourcesMapped   | 2 with the first firmware patch, 3 with the GPIO-window patch |
+| GpioMapped           | 1 if the RP1 GPIO bank window was mapped, else 0             |
+| PhyResetPulsed       | 1 if the driver pulsed RP1 GPIO 32 (PHY reset)               |
+| GemModuleId          | 0x00000000 or 0xFFFFFFFF = block not reachable;              |
+|                      | anything else = a live GEM (IDNUM in bits 27:16, e.g. 0x00070163) |
+| PhyAddrBeforeReset   | MDIO address where a PHY answered before the reset pulse, or 0xFFFFFFFF (4294967295) for none |
+| PhyId1BeforeReset / PhyId2BeforeReset | that PHY's ID words (0 if none)             |
+| PhyAddrAfterReset    | MDIO address where a PHY answered after the reset pulse, or 0xFFFFFFFF for none |
+| PhyId1Reg2 / PhyId2Reg3 | ID words of the PHY found after reset (0 if none)         |
+| PhyAddr1Reg2 / PhyAddr1Reg3 | raw reads at address 1 (the device-tree address); 65535 (0xFFFF) = nothing driving the bus |
+
+First results (v1, Pi 5, firmware with the ETH0 ACPI device): MemResourcesMapped 2,
+GemModuleId 0x00070163 (live GEM), MDIO completed, PHY ID words 0xFFFF at address 1,
+so no PHY was answering. v2 adds the reset pulse and an all-address scan to find out why.
 
 ## Risks
 - Reading an unclocked RP1 block may hang the system. If the Pi freezes at boot
   after installing, boot the 32GB EFI card or Safe Mode and remove the driver
   (`pnputil /delete-driver oemNN.inf /uninstall /force`).
-- Nothing here brings up clocks, reset or the PHY. The firmware still has to do
-  that (see rp1-eth-bringup-notes.md).
+- v2 drives RP1 GPIO 32 (output, low then high). That is the PHY reset line on the Pi 5
+  according to the Raspberry Pi device tree, but this is untested on hardware.
+- The Ethernet clocks (clk_eth, clk_eth_tsu) are still not enabled by anything, so the
+  data path cannot work yet (see firmware/rp1-eth-bringup-notes.md).
