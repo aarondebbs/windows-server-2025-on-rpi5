@@ -30,6 +30,11 @@ Characteristics = 0x84           ; NCF_PHYSICAL | NCF_HAS_UI
 *IfType         = 6              ; IF_TYPE_ETHERNET_CSMACD
 *MediaType      = 0              ; NdisMedium802_3
 *PhysicalMediaType = 14          ; NdisPhysicalMedium802_3
+*IfConnectorPresent = 1
+*ConnectionType = 1
+*DirectionType  = 0
+*AccessType     = 2
+*HardwareLoopback = 0
 CopyFiles       = RpiEthNic_Files
 
 [RpiEthNic_Files]

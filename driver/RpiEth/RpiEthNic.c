@@ -167,6 +167,23 @@ typedef struct _QUEUE_CTX {
 } QUEUE_CTX;
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(QUEUE_CTX, GetQueueCtx)
 
+/* Progress trace: writes LastStep/LastStatus under
+ * HKLM\SYSTEM\CurrentControlSet\Services\RpiEthNic\Parameters so a failed
+ * start can be diagnosed from regedit. Step numbers: see Trace() call sites. */
+static VOID Trace(ULONG Step, NTSTATUS Status)
+{
+    WDFKEY Key;
+    DECLARE_CONST_UNICODE_STRING(NStep, L"LastStep");
+    DECLARE_CONST_UNICODE_STRING(NStat, L"LastStatus");
+    if (NT_SUCCESS(WdfDriverOpenParametersRegistryKey(WdfGetDriver(), KEY_SET_VALUE,
+                                                      WDF_NO_OBJECT_ATTRIBUTES, &Key))) {
+        (VOID)WdfRegistryAssignULong(Key, &NStep, Step);
+        (VOID)WdfRegistryAssignULong(Key, &NStat, (ULONG)Status);
+        WdfRegistryClose(Key);
+    }
+}
+#define STEP(n, expr) do { NTSTATUS _s = (expr); Trace((n), _s); if (!NT_SUCCESS(_s)) return _s; } while (0)
+
 /* ------------------------------------------------------------------ */
 /* Register helpers                                                   */
 /* ------------------------------------------------------------------ */
@@ -781,7 +798,7 @@ static NTSTATUS EvtPrepareHardware(_In_ WDFDEVICE Device, _In_ WDFCMRESLIST Raw,
         PVOID Va;
         if (D->Type != CmResourceTypeMemory) continue;
         Va = MmMapIoSpaceEx(D->u.Memory.Start, D->u.Memory.Length, PAGE_READWRITE | PAGE_NOCACHE);
-        if (!Va) return STATUS_INSUFFICIENT_RESOURCES;
+        if (!Va) { Trace(10, STATUS_INSUFFICIENT_RESOURCES); return STATUS_INSUFFICIENT_RESOURCES; }
         switch (Idx) {
         case 0: N->Gem  = Va; N->GemLen  = D->u.Memory.Length; break;
         case 1: N->Cfg  = Va; N->CfgLen  = D->u.Memory.Length; break;
@@ -792,20 +809,21 @@ static NTSTATUS EvtPrepareHardware(_In_ WDFDEVICE Device, _In_ WDFCMRESLIST Raw,
         }
         Idx++;
     }
-    if (!N->Gem || !N->Gpio) return STATUS_DEVICE_CONFIGURATION_ERROR;
+    if (!N->Gem || !N->Gpio) { Trace(11, STATUS_DEVICE_CONFIGURATION_ERROR); return STATUS_DEVICE_CONFIGURATION_ERROR; }
+    Trace(12, STATUS_SUCCESS);         /* resources mapped */
 
     LoadSettings(N);
 
     WdfDeviceSetAlignmentRequirement(Device, FILE_64_BYTE_ALIGNMENT);
     WDF_DMA_ENABLER_CONFIG_INIT(&DC, WdfDmaProfileScatterGather64, 0x10000);
     DC.WdmDmaVersionOverride = 3;
-    S = WdfDmaEnablerCreate(Device, &DC, WDF_NO_OBJECT_ATTRIBUTES, &N->Dma);
-    if (!NT_SUCCESS(S)) return S;
-    S = CreateRings(N);
-    if (!NT_SUCCESS(S)) return S;
-
+    STEP(13, WdfDmaEnablerCreate(Device, &DC, WDF_NO_OBJECT_ATTRIBUTES, &N->Dma));
+    STEP(14, CreateRings(N));
     SetCapabilities(N);
-    return NetAdapterStart(N->Adapter);
+    Trace(15, STATUS_SUCCESS);
+    S = NetAdapterStart(N->Adapter);
+    Trace(16, S);                      /* NetAdapterStart result */
+    return S;
 }
 
 static NTSTATUS EvtReleaseHardware(_In_ WDFDEVICE Device, _In_ WDFCMRESLIST Tr)
@@ -838,12 +856,18 @@ static NTSTATUS EvtD0Entry(_In_ WDFDEVICE Device, _In_ WDF_POWER_DEVICE_STATE Pr
     P(N, GEM_SA1T, N->Mac[4] | (N->Mac[5] << 8));
     P(N, GEM_NCR, NCR_MPE);
 
-    if (!NT_SUCCESS(PhyBringUp(N))) {
+    {
+        NTSTATUS ps = PhyBringUp(N);
+        Trace(21, ps);                 /* PHY bring-up result */
+        if (!NT_SUCCESS(ps)) N->PhyUp = FALSE;
+    }
+    if (FALSE) {
         N->PhyUp = FALSE;                  /* adapter stays media-disconnected */
     }
     N->LinkUp = FALSE;
     PublishLink(N, FALSE, 0, FALSE);
     WdfTimerStart(N->LinkTimer, WDF_REL_TIMEOUT_IN_SEC(1));
+    Trace(22, STATUS_SUCCESS);         /* D0 entry finished */
     return STATUS_SUCCESS;
 }
 
@@ -877,8 +901,7 @@ static NTSTATUS EvtDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT Devi
     WDF_OBJECT_ATTRIBUTES TA;
     UNREFERENCED_PARAMETER(Driver);
 
-    S = NetDeviceInitConfig(DeviceInit);
-    if (!NT_SUCCESS(S)) return S;
+    STEP(1, NetDeviceInitConfig(DeviceInit));
 
     WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&Pnp);
     Pnp.EvtDevicePrepareHardware = EvtPrepareHardware;
@@ -888,23 +911,20 @@ static NTSTATUS EvtDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT Devi
     WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &Pnp);
 
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&A, NIC_DEVICE);
-    S = WdfDeviceCreate(&DeviceInit, &A, &Device);
-    if (!NT_SUCCESS(S)) return S;
+    STEP(2, WdfDeviceCreate(&DeviceInit, &A, &Device));
     N = GetNic(Device);
     N->Device = Device;
 
     WDF_INTERRUPT_CONFIG_INIT(&IC, EvtIsr, EvtDpc);
     IC.AutomaticSerialization = FALSE;
-    S = WdfInterruptCreate(Device, &IC, WDF_NO_OBJECT_ATTRIBUTES, &N->Interrupt);
-    if (!NT_SUCCESS(S)) return S;
+    STEP(3, WdfInterruptCreate(Device, &IC, WDF_NO_OBJECT_ATTRIBUTES, &N->Interrupt));
 
     WDF_TIMER_CONFIG_INIT_PERIODIC(&TC, EvtLinkTimer, 1000);
     TC.AutomaticSerialization = FALSE;
     WDF_OBJECT_ATTRIBUTES_INIT(&TA);
     TA.ParentObject = Device;
     TA.ExecutionLevel = WdfExecutionLevelPassive;
-    S = WdfTimerCreate(&TC, &TA, &N->LinkTimer);
-    if (!NT_SUCCESS(S)) return S;
+    STEP(4, WdfTimerCreate(&TC, &TA, &N->LinkTimer));
 
     AI = NetAdapterInitAllocate(Device);
     if (!AI) return STATUS_INSUFFICIENT_RESOURCES;
@@ -913,9 +933,11 @@ static NTSTATUS EvtDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT Devi
 
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&A, ADAPTER_CTX);
     S = NetAdapterCreate(AI, &A, &Adapter);
+    Trace(6, S);
     if (!NT_SUCCESS(S)) { NetAdapterInitFree(AI); return S; }
     GetAdapterCtx(Adapter)->Nic = N;
     N->Adapter = Adapter;
+    Trace(7, STATUS_SUCCESS);          /* DeviceAdd finished */
     return STATUS_SUCCESS;
 }
 
