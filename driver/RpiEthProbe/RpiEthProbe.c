@@ -313,6 +313,7 @@ RpiEthEvtPrepareHardware(
     USHORT RawPadFix[32] = {0};
     ULONG AddrPadFix = PHY_NOT_FOUND, PadFixOnes = 0, PadFixZ = 0, PadFixO = 0;
     ULONG StAfterFix = 0;
+    ULONG LinkRegs[8] = {0};   /* BMCR, BMSR, ADV, LPA, 1000CTL, 1000ST, BMSR again, 0xFFFF=read fail */
     ULONG DtAddrId2 = 0xFFFF, DtAddrId3 = 0xFFFF;
     USHORT RawBefore[32] = {0};
     USHORT RawHigh1[32]  = {0};
@@ -353,6 +354,7 @@ RpiEthEvtPrepareHardware(
     DECLARE_CONST_UNICODE_STRING(NameRawH1,      L"RawScanDrivenHigh");
     DECLARE_CONST_UNICODE_STRING(NameRawL,       L"RawScanDrivenLow");
     DECLARE_CONST_UNICODE_STRING(NameRawA,       L"RawScanAfter");
+    DECLARE_CONST_UNICODE_STRING(NameLink,       L"PhyLinkRegs");
     DECLARE_CONST_UNICODE_STRING(NameG32PadB,    L"Gpio32PadBefore");
     DECLARE_CONST_UNICODE_STRING(NameG32PadA,    L"Gpio32PadAfter");
     DECLARE_CONST_UNICODE_STRING(NameG32PadM,    L"Gpio32PadMapped");
@@ -539,7 +541,32 @@ RpiEthEvtPrepareHardware(
         DtAddrId3 = R3;
     }
 
+    /* 6. Link test: restart auto-negotiation, wait, read PHY link registers.
+     *    Plug the cable in BEFORE booting. LinkRegs order:
+     *    [0]BMCR [1]BMSR [2]ADV(4) [3]LPA(5) [4]1000CTL(9) [5]1000ST(10) [6]BMSR(2nd read) */
+    if (AddrAfter != PHY_NOT_FOUND) {
+        static const ULONG Regs[7] = {0, 1, 4, 5, 9, 10, 1};
+        USHORT V = 0;
+        ULONG k;
+        if (NT_SUCCESS(PhyRead(Ctx, AddrAfter, 0, &V))) {
+            /* BMCR: autoneg enable (bit 12) + restart (bit 9). Register write
+             * through MAN: write opcode = 1 in bits 29:28. */
+            if (MdioWaitIdle(Ctx)) {
+                GemWrite(Ctx, GEM_MAN, MAN_SOF_CL22 | (1UL << 28) | MAN_CODE |
+                         MAN_PHYA(AddrAfter) | MAN_REGA(0) | (ULONG)(V | 0x1200));
+                (VOID)MdioWaitIdle(Ctx);
+            }
+        }
+        MsDelay(4000);
+        for (k = 0; k < 7; k++) {
+            USHORT R = 0xFFFF;
+            if (!NT_SUCCESS(PhyRead(Ctx, AddrAfter, Regs[k], &R))) R = 0xFFFF;
+            LinkRegs[k] = R;
+        }
+    }
+
     if (Key != NULL) {
+        (VOID)WdfRegistryAssignValue(Key, &NameLink, REG_BINARY, sizeof(LinkRegs), LinkRegs);
         SaveUlong(Key, &NameMem,        MemIndex);
         SaveUlong(Key, &NameGpio,       Ctx->Gpio != NULL);
         SaveUlong(Key, &NameResetDone,  ResetDone);
