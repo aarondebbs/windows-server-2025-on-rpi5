@@ -1,0 +1,79 @@
+diff --git a/Silicon/RaspberryPi/RpiSiliconPkg/Drivers/Rp1BusDxe/Rp1BusDxe.c b/Silicon/RaspberryPi/RpiSiliconPkg/Drivers/Rp1BusDxe/Rp1BusDxe.c
+index aed8ae8..a4294ec 100644
+--- a/Silicon/RaspberryPi/RpiSiliconPkg/Drivers/Rp1BusDxe/Rp1BusDxe.c
++++ b/Silicon/RaspberryPi/RpiSiliconPkg/Drivers/Rp1BusDxe/Rp1BusDxe.c
+@@ -102,6 +102,12 @@ Rp1BusEnableInterrupts (
+     Rp1Data->PeripheralBase + RP1_PCIE_REG_SET + RP1_PCIE_MSIX_CFG (RP1_INT_USBHOST1_0),
+     RP1_PCIE_MSIX_CFG_ENABLE
+     );
++
++  // Ethernet (experimental): route the MAC interrupt to the shared RP1 line.
++  MmioWrite32 (
++    Rp1Data->PeripheralBase + RP1_PCIE_REG_SET + RP1_PCIE_MSIX_CFG (RP1_INT_ETH),
++    RP1_PCIE_MSIX_CFG_ENABLE
++    );
+ }
+ 
+ STATIC
+diff --git a/Silicon/RaspberryPi/RpiSiliconPkg/Include/Rp1.asi b/Silicon/RaspberryPi/RpiSiliconPkg/Include/Rp1.asi
+index 9de562b..ab091d1 100644
+--- a/Silicon/RaspberryPi/RpiSiliconPkg/Include/Rp1.asi
++++ b/Silicon/RaspberryPi/RpiSiliconPkg/Include/Rp1.asi
+@@ -58,3 +58,38 @@ Device (XHC1) {
+     Return (RBUF)
+   }
+ }
++
++//
++// Ethernet MAC (Cadence GEM) - EXPERIMENTAL
++//
++// There is no in-box Windows driver for this controller, so the HID below is
++// a private placeholder for a custom NDIS miniport. Change it to whatever ID
++// the driver INF matches.
++//
++// Resource 0: GEM register window     (RP1_ETH_BASE)
++// Resource 1: Ethernet config window  (RP1_ETH_CFG_BASE, size assumed)
++// Resource 2: shared RP1 level interrupt (RP1_INT_ETH is routed to PINT)
++//
++// NOTE: this only makes the device visible. Clocks, reset and PHY bring-up
++// are NOT done by firmware yet, so the MAC will not pass traffic.
++//
++Device (ETH0) {
++  Name (_HID, "RPIE0001")
++  Name (_UID, 0x0)
++
++  // PHY address on the MDIO bus and interface mode, from the Pi 5 device tree.
++  Name (PHYA, 0x1)
++  Name (PHYM, "rgmii-id")
++
++  Method (_CRS, 0, Serialized) {
++    Name (RBUF, ResourceTemplate () {
++      RP1_QWORDMEMORY_BUF (00)
++      RP1_QWORDMEMORY_BUF (01)
++      RP1_INTERRUPT_BUF (02)
++    })
++    RP1_QWORDMEMORY_SET (00, RP1_ETH_BASE, RP1_ETH_SIZE)
++    RP1_QWORDMEMORY_SET (01, RP1_ETH_CFG_BASE, RP1_ETH_CFG_SIZE)
++    RP1_INTERRUPT_SET (02)
++    Return (RBUF)
++  }
++}
+diff --git a/Silicon/RaspberryPi/RpiSiliconPkg/Include/Rp1.h b/Silicon/RaspberryPi/RpiSiliconPkg/Include/Rp1.h
+index d136c51..1d309cc 100644
+--- a/Silicon/RaspberryPi/RpiSiliconPkg/Include/Rp1.h
++++ b/Silicon/RaspberryPi/RpiSiliconPkg/Include/Rp1.h
+@@ -109,6 +109,14 @@
+ 
+ #define RP1_USBHOST_SIZE                            0x00100000
+ 
++//
++// Ethernet (Cadence GEM). The register window size comes from the Raspberry Pi
++// Linux device tree (reg = <... 0x4000>) for ethernet@100000. The CFG block
++// size is an assumption (one 16K RP1 block) and is not documented upstream.
++//
++#define RP1_ETH_SIZE                                0x00004000
++#define RP1_ETH_CFG_SIZE                            0x00004000
++
+ //
+ // Local MSI-X vectors
+ //

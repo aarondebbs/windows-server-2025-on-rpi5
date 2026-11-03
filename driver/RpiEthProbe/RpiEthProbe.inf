@@ -1,0 +1,57 @@
+; RpiEthProbe.inf - EXPERIMENTAL probe driver for Raspberry Pi 5 RP1 Ethernet
+; Matches the ACPI device added by the rp1-eth-acpi firmware patch.
+; Keep $KMDFVERSION$ if you build from a Visual Studio KMDF project: the WDK
+; replaces it at build time. If you build another way, put your KMDF version
+; (for example 1.33) there instead.
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4D36E97D-E325-11CE-B511-08002BE2B2D3}
+Provider    = %ManufacturerName%
+DriverVer   = 11/03/2026,1.0.0.0
+CatalogFile = RpiEthProbe.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+RpiEthProbe.sys = 1,,
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTarm64
+
+[Standard.NTarm64]
+%DeviceDesc% = RpiEth_Install, ACPI\RPIE0001
+
+[RpiEth_Install.NT]
+CopyFiles = RpiEth_Files
+
+[RpiEth_Files]
+RpiEthProbe.sys
+
+[RpiEth_Install.NT.Services]
+AddService = RpiEthProbe, 0x00000002, RpiEth_Service
+
+[RpiEth_Service]
+DisplayName   = %ServiceDesc%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %13%\RpiEthProbe.sys
+
+[RpiEth_Install.NT.Wdf]
+KmdfService = RpiEthProbe, RpiEth_wdfsect
+
+[RpiEth_wdfsect]
+KmdfLibraryVersion = $KMDFVERSION$
+
+[Strings]
+ManufacturerName = "Experimental"
+DiskName         = "RpiEthProbe Installation Disk"
+DeviceDesc       = "Raspberry Pi 5 RP1 Ethernet (probe)"
+ServiceDesc      = "Raspberry Pi 5 RP1 Ethernet probe driver"
