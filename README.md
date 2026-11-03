@@ -31,3 +31,21 @@ Notes, patches and experimental code from an attempt to run **Windows Server (AR
 
 ## Licensing and sources
 The patch modifies code under BSD-2-Clause-Patent (EDK2/edk2-platforms). No Microsoft binaries or ISOs are included; obtain Windows images yourself and respect the Insider Terms of Use.
+
+
+## Status (2026-11-04)
+
+- PHY bring-up works: the PHY (Broadcom BCM54213PE, ID 0x600d84a2, MDIO address 1)
+  only answers after the RP1 pad for GPIO 32 has its output-disable bit cleared and the
+  reset line is pulsed. Clocks and Ethernet pads were already enabled by the Pi boot code.
+- `driver/RpiEth/RpiEthNic.c` is a NetAdapterCx driver (KMDF 1.33, NetAdapterCx 2.4).
+  It installs, starts, brings up the PHY and reports link state to Windows.
+- The data path (DMA) is OFF by default (`DataPath` registry value = 0). With it on, the
+  first test froze the machine, probably because the DMA address the RP1 needs is not
+  yet known (see `driver/RpiEth/DESIGN.md`, registry `DmaAddrOffsetHigh`).
+- No internet yet: the packet engines are not enabled.
+
+### Next steps
+1. Work out the DMA address the GEM must be given (try `DmaAddrOffsetHigh` = 0x10).
+2. Enable `DataPath` one engine at a time (TX first, then RX) and check for traffic.
+3. Receive filtering, multicast, offloads, 10/100 TX clock divider.
