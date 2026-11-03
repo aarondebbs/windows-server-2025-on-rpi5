@@ -924,7 +924,7 @@ static NTSTATUS EvtDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT Devi
     TC.AutomaticSerialization = FALSE;
     WDF_OBJECT_ATTRIBUTES_INIT(&TA);
     TA.ParentObject = Device;
-    TA.ExecutionLevel = WdfExecutionLevelPassive;
+    TA.ExecutionLevel = WdfExecutionLevelDispatch;   /* passive + periodic is not supported (0xC00000BB) */
     STEP(4, WdfTimerCreate(&TC, &TA, &N->LinkTimer));
 
     AI = NetAdapterInitAllocate(Device);
