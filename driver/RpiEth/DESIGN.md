@@ -1,21 +1,28 @@
-# RpiEth data driver (skeleton, UNTESTED, not yet buildable)
+# RpiEth data driver (UNTESTED, never compiled against the WDK)
 
-Status: the hardware layer (`gem_regs.h`, `gem_hw.[ch]`) compiles as plain C
-(syntax-checked on Linux with stub register accessors). It has never touched
-real hardware. The NetAdapterCx glue is NOT written yet.
+`RpiEthNic.c` is a NetAdapterCx KMDF driver for the RP1 GEM + BCM54213PE.
+It was written from the Raspberry Pi Linux `macb` driver and Microsoft's
+NetAdapterCx docs/sample, and has not been built or run.
 
-## Blocked on
-1. A PHY answering on MDIO (probe driver v5 tests the reset pad fix).
-2. DMA: confirm which addresses the GEM can reach through the RP1 PCIe bridge
-   (the skeleton assumes 32-bit buffer addresses, so rings and buffers must be
-   below 4 GB) and whether memory is cache-coherent. Wrong guess = corruption.
-3. RGMII TX clock: clk_eth must follow link speed (125/25/2.5 MHz). Needs the
-   RP1 clock window (already in the ACPI device).
+## What it does
+- Maps the five ACPI memory windows (GEM, cfg, GPIO bank1+pads, ETH pads, clocks).
+- D0 entry: configures the GEM (RGMII, 64-bit descriptors, MDC divider),
+  clears the GPIO 32 pad output-disable bit, resets the PHY, verifies the
+  Broadcom ID, enables RGMII-ID delays, restarts auto-negotiation.
+- 1 s timer reads the PHY link and publishes link state/speed.
+- TX/RX packet queues over 128-entry rings in WDF common buffers; one fragment
+  per TX packet; ISR masks interrupts and the DPC notifies the queues.
 
-## Still to write
-- KMDF/NetAdapterCx glue: NetAdapterCreate, link state from `GemPhyLink`,
-  packet queues (TX/RX) over the rings, interrupt DPC (RP1 shared line, MSI-X
-  already enabled by firmware), MAC address source (Pi 5 OTP/DT, or random).
-- DMA allocation via WDF common buffers (32-bit mask) and RX buffer attach.
-- 64-bit descriptors if buffers above 4 GB are ever needed.
-- INF as a Net class driver, matching ACPI\RPIE0001.
+## Registry knobs (device key, Device Parameters)
+- `DmaAddrOffsetHigh` (DWORD): value added (shifted left 32) to every DMA
+  address given to the GEM. Default 0. If the RP1 sees host RAM at a PCIe
+  offset (Linux device tree suggests 0x10_0000_0000), set it to 0x10.
+- `OnlyGigabit` (DWORD, default 1): advertise 1000BASE-T only so the RGMII TX
+  clock stays at 125 MHz. Set 0 to allow 10/100 (clock divider unverified).
+- `MacAddress` (REG_BINARY 6): generated on first start if the GEM has none.
+
+## Open problems
+1. DMA addressing and cache coherency through the RP1 PCIe bridge.
+2. 10/100 TX clock divider (guess: 125 MHz / 5 or / 50).
+3. Receive filter: the GEM currently copies all frames.
+4. Offloads (checksum, TSO), multicast hash, flow control, power management.

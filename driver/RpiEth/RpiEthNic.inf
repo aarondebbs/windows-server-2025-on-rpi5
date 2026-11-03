@@ -1,0 +1,58 @@
+; RpiEthNic.inf - EXPERIMENTAL NetAdapterCx driver for the Raspberry Pi 5 RP1 Ethernet.
+; Replaces the RpiEthProbe driver (both match ACPI\RPIE0001; uninstall the probe first).
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = Net
+ClassGuid   = {4d36e972-e325-11ce-bfc1-08002be10318}
+Provider    = %ManufacturerName%
+DriverVer   = 11/03/2026,1.0.0.0
+CatalogFile = RpiEthNic.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+RpiEthNic.sys = 1,,
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTarm64.10.0...16299
+
+[Standard.NTarm64.10.0...16299]
+%DeviceDesc% = RpiEthNic_Install, ACPI\RPIE0001
+
+[RpiEthNic_Install.NT]
+Characteristics = 0x84           ; NCF_PHYSICAL | NCF_HAS_UI
+*IfType         = 6              ; IF_TYPE_ETHERNET_CSMACD
+*MediaType      = 0              ; NdisMedium802_3
+*PhysicalMediaType = 14          ; NdisPhysicalMedium802_3
+CopyFiles       = RpiEthNic_Files
+
+[RpiEthNic_Files]
+RpiEthNic.sys
+
+[RpiEthNic_Install.NT.Services]
+AddService = RpiEthNic, 0x00000002, RpiEthNic_Service
+
+[RpiEthNic_Service]
+DisplayName   = %ServiceDesc%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %13%\RpiEthNic.sys
+
+[RpiEthNic_Install.NT.Wdf]
+KmdfService = RpiEthNic, RpiEthNic_wdfsect
+
+[RpiEthNic_wdfsect]
+KmdfLibraryVersion = $KMDFVERSION$
+
+[Strings]
+ManufacturerName = "Experimental"
+DiskName         = "RpiEthNic Installation Disk"
+DeviceDesc       = "Raspberry Pi 5 RP1 Gigabit Ethernet"
+ServiceDesc      = "Raspberry Pi 5 RP1 Ethernet driver"
