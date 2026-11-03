@@ -151,6 +151,7 @@ typedef struct _NIC_DEVICE {
 
     UINT64 DmaOffset;
     ULONG  OnlyGigabit;
+    ULONG  DataPath;      /* 0 = link only (no DMA engines), 1 = full data path */
     UCHAR  Mac[6];
     BOOLEAN PhyUp;
     BOOLEAN LinkUp;
@@ -183,6 +184,16 @@ static VOID Trace(ULONG Step, NTSTATUS Status)
         WdfRegistryClose(Key);
     }
 }
+static VOID TraceVal(PCUNICODE_STRING Name, ULONG Value)
+{
+    WDFKEY Key;
+    if (NT_SUCCESS(WdfDriverOpenParametersRegistryKey(WdfGetDriver(), KEY_SET_VALUE,
+                                                      WDF_NO_OBJECT_ATTRIBUTES, &Key))) {
+        (VOID)WdfRegistryAssignULong(Key, Name, Value);
+        WdfRegistryClose(Key);
+    }
+}
+#define TRACEVAL(NameW, V) do { DECLARE_CONST_UNICODE_STRING(_n, NameW); TraceVal(&_n, (ULONG)(V)); } while (0)
 #define STEP(n, expr) do { NTSTATUS _s = (expr); Trace((n), _s); if (!NT_SUCCESS(_s)) return _s; } while (0)
 
 /* ------------------------------------------------------------------ */
@@ -352,6 +363,8 @@ static VOID EvtLinkTimer(_In_ WDFTIMER Timer)
         if (Up) SetMacSpeed(N, Mbps, Full);
         N->LinkUp = Up;
         N->LinkMbps = Mbps;
+        TRACEVAL(L"LinkUp", Up);
+        TRACEVAL(L"LinkMbps", Mbps);
         PublishLink(N, Up, Mbps, Full);
     }
 }
@@ -415,7 +428,8 @@ static VOID EvtRxStart(_In_ NETPACKETQUEUE Q)
     N->RxPost = N->RxClean = 0;
     P(N, GEM_RBQP, (ULONG)A);
     P(N, GEM_RBQPH, (ULONG)(A >> 32));
-    P(N, GEM_NCR, G(N, GEM_NCR) | NCR_RE);
+    TRACEVAL(L"RxQueueStarted", N->DataPath);
+    if (N->DataPath) P(N, GEM_NCR, G(N, GEM_NCR) | NCR_RE);
 }
 
 static VOID EvtRxStop(_In_ NETPACKETQUEUE Q)
@@ -500,7 +514,7 @@ static VOID EvtRxCancel(_In_ NETPACKETQUEUE Q)
 static VOID EvtRxSetNotify(_In_ NETPACKETQUEUE Q, _In_ BOOLEAN Enable)
 {
     PNIC_DEVICE N = GetQueueCtx(Q)->Nic;
-    P(N, Enable ? GEM_IER : GEM_IDR, INT_RCOMP | INT_RXUBR);
+    if (N->DataPath || !Enable) P(N, Enable ? GEM_IER : GEM_IDR, INT_RCOMP | INT_RXUBR);
 }
 
 /* ------------------------------------------------------------------ */
@@ -520,7 +534,8 @@ static VOID EvtTxStart(_In_ NETPACKETQUEUE Q)
     N->TxPost = N->TxClean = 0;
     P(N, GEM_TBQP, (ULONG)A);
     P(N, GEM_TBQPH, (ULONG)(A >> 32));
-    P(N, GEM_NCR, G(N, GEM_NCR) | NCR_TE);
+    TRACEVAL(L"TxQueueStarted", N->DataPath);
+    if (N->DataPath) P(N, GEM_NCR, G(N, GEM_NCR) | NCR_TE);
 }
 
 static VOID EvtTxStop(_In_ NETPACKETQUEUE Q)
@@ -565,7 +580,7 @@ static VOID EvtTxAdvance(_In_ NETPACKETQUEUE Q)
         idx = NetRingIncrementIndex(PR, idx);
     }
     PR->NextIndex = idx;
-    if (Posted) {
+    if (Posted && N->DataPath) {
         KeMemoryBarrier();
         P(N, GEM_NCR, G(N, GEM_NCR) | NCR_TSTART);
     }
@@ -603,7 +618,7 @@ static VOID EvtTxCancel(_In_ NETPACKETQUEUE Q)
 static VOID EvtTxSetNotify(_In_ NETPACKETQUEUE Q, _In_ BOOLEAN Enable)
 {
     PNIC_DEVICE N = GetQueueCtx(Q)->Nic;
-    P(N, Enable ? GEM_IER : GEM_IDR, INT_TCOMP);
+    if (N->DataPath || !Enable) P(N, Enable ? GEM_IER : GEM_IDR, INT_TCOMP);
 }
 
 /* ------------------------------------------------------------------ */
@@ -685,6 +700,7 @@ static VOID LoadSettings(PNIC_DEVICE N)
 
     N->DmaOffset = 0;
     N->OnlyGigabit = 1;
+    N->DataPath = 0;
 
     if (!NT_SUCCESS(WdfDeviceOpenRegistryKey(N->Device, PLUGPLAY_REGKEY_DEVICE,
                                              KEY_ALL_ACCESS, WDF_NO_OBJECT_ATTRIBUTES, &Key))) {
@@ -697,6 +713,10 @@ static VOID LoadSettings(PNIC_DEVICE N)
             N->DmaOffset = (UINT64)Hi << 32;     /* e.g. 0x10 -> 0x10_0000_0000 */
         }
         if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NOnly, &V))) N->OnlyGigabit = V;
+        {
+            DECLARE_CONST_UNICODE_STRING(NData, L"DataPath");
+            if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NData, &V))) N->DataPath = V;
+        }
     }
     UNREFERENCED_PARAMETER(NDma);
 
@@ -860,6 +880,7 @@ static NTSTATUS EvtD0Entry(_In_ WDFDEVICE Device, _In_ WDF_POWER_DEVICE_STATE Pr
     {
         NTSTATUS ps = PhyBringUp(N);
         Trace(21, ps);                 /* PHY bring-up result */
+        TRACEVAL(L"PhyStatus", ps);
         if (!NT_SUCCESS(ps)) N->PhyUp = FALSE;
     }
     if (FALSE) {
