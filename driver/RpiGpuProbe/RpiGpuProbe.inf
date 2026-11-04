@@ -1,0 +1,57 @@
+; RpiGpuProbe.inf - EXPERIMENTAL probe driver for the Raspberry Pi 5 VideoCore side
+; (firmware mailbox, PM block, V3D). Matches the ACPI device added by
+; firmware/gpu-acpi.patch (HID RPIG0001).
+; Keep $KMDFVERSION$ if you build from a Visual Studio KMDF project: the WDK
+; replaces it at build time.
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4D36E97D-E325-11CE-BFC1-08002BE10318}
+Provider    = %ManufacturerName%
+DriverVer   = 11/05/2026,1.0.0.0
+CatalogFile = RpiGpuProbe.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+RpiGpuProbe.sys = 1,,
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTarm64.10.0...16299
+
+[Standard.NTarm64.10.0...16299]
+%DeviceDesc% = RpiGpu_Install, ACPI\RPIG0001
+
+[RpiGpu_Install.NT]
+CopyFiles = RpiGpu_Files
+
+[RpiGpu_Files]
+RpiGpuProbe.sys
+
+[RpiGpu_Install.NT.Services]
+AddService = RpiGpuProbe, 0x00000002, RpiGpu_Service
+
+[RpiGpu_Service]
+DisplayName   = %ServiceDesc%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %13%\RpiGpuProbe.sys
+
+[RpiGpu_Install.NT.Wdf]
+KmdfService = RpiGpuProbe, RpiGpu_wdfsect
+
+[RpiGpu_wdfsect]
+KmdfLibraryVersion = $KMDFVERSION$
+
+[Strings]
+ManufacturerName = "Experimental"
+DiskName         = "RpiGpuProbe Installation Disk"
+DeviceDesc       = "Raspberry Pi 5 VideoCore / GPU (probe)"
+ServiceDesc      = "Raspberry Pi 5 VideoCore / GPU probe driver"

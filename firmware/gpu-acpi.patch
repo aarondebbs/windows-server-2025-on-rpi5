@@ -1,0 +1,51 @@
+diff --git a/Platform/RaspberryPi/RPi5/AcpiTables/Dsdt.asl b/Platform/RaspberryPi/RPi5/AcpiTables/Dsdt.asl
+index 77d41ef..109658a 100644
+--- a/Platform/RaspberryPi/RPi5/AcpiTables/Dsdt.asl
++++ b/Platform/RaspberryPi/RPi5/AcpiTables/Dsdt.asl
+@@ -108,6 +108,46 @@ DefinitionBlock ("Dsdt.aml", "DSDT", 2, "RPIFDN", "RPI5    ", 2)
+           }
+         })
+       }
++
++      //
++      // VideoCore / GPU (EXPERIMENTAL, for the RpiGpuProbe driver)
++      //
++      // The HID is a private placeholder; the driver INF matches it. Nothing
++      // is initialised here, this only makes the blocks visible to Windows.
++      // Addresses and interrupts come from the Raspberry Pi Linux device
++      // tree (bcm2712.dtsi, bcm2712-ds.dtsi). GSIV = GIC SPI number + 32.
++      //
++      // Resource 0: firmware mailbox registers (mailbox@7c013880), property channel 8
++      // Resource 1: PM block (watchdog@7d200000); PM_GRAFX_2712 at +0x304 holds the V3D reset bit
++      // Resource 2: V3D hub registers   (v3d "hub",   0x10_02000000)
++      // Resource 3: V3D core 0 registers (v3d "core0", 0x10_02008000)
++      // Resource 4: V3D SMS registers   (v3d "sms",   0x10_02030800)
++      // Interrupt 0: V3D hub  (SPI 250)
++      // Interrupt 1: V3D core (SPI 249)
++      //
++      Device (VCR0) {
++        Name (_HID, "RPIG0001")
++        Name (_UID, 0x0)
++        Name (_CCA, 0x0)
++
++        Method (_CRS, 0x0, Serialized) {
++          Name (RBUF, ResourceTemplate () {
++            QWORDMEMORY_BUF (00, ResourceConsumer)
++            QWORDMEMORY_BUF (01, ResourceConsumer)
++            QWORDMEMORY_BUF (02, ResourceConsumer)
++            QWORDMEMORY_BUF (03, ResourceConsumer)
++            QWORDMEMORY_BUF (04, ResourceConsumer)
++            Interrupt (ResourceConsumer, Level, ActiveHigh, Exclusive) { 282 }
++            Interrupt (ResourceConsumer, Level, ActiveHigh, Exclusive) { 281 }
++          })
++          QWORD_SET (00, 0x107C013880, 0x40,   0)
++          QWORD_SET (01, 0x107D200000, 0x400,  0)
++          QWORD_SET (02, 0x1002000000, 0x4000, 0)
++          QWORD_SET (03, 0x1002008000, 0x6000, 0)
++          QWORD_SET (04, 0x1002030800, 0x700,  0)
++          Return (RBUF)
++        }
++      }
+     } // Device (SOCB)
+ 
+     //

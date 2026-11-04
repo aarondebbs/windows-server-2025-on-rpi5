@@ -90,23 +90,27 @@ Running **Windows Server (ARM64 Insider preview)** natively on a **Raspberry Pi 
 - [ ] Throughput and stability testing
 - [ ] Run without test signing (needs a Microsoft-signed build)
 
-**Graphics**
-- [ ] 📅 Raspberry Pi graphics driver, see below
+**Graphics** (see [the plan](docs/graphics-driver-plan.md))
+- [x] Map the display and GPU hardware from the Linux drivers and the Pi 5 firmware
+- [ ] 🚧 Stage 0: probe driver and firmware ACPI patch (drafted, not run yet)
+- [ ] 📅 Stage 1: firmware-assisted display-only driver (resolution control)
+- [ ] 📅 Stage 2: native display pipeline (HVS, HDMI)
+- [ ] 📅 Stage 3: V3D 3D support (Vulkan)
 
 ---
 
 ## Upcoming: graphics driver
 
-> **Status: planned, not started.** Today the Pi shows the firmware's plain framebuffer through Microsoft Basic Display Adapter: one fixed mode, no acceleration.
+> **Status: research done, first probe drafted, nothing run on hardware yet.** Today the Pi shows the firmware's plain framebuffer through Microsoft Basic Display Adapter: one fixed mode, no acceleration. The full plan, with the hardware map taken from the Linux `vc4`/`v3d` drivers, is in [`docs/graphics-driver-plan.md`](docs/graphics-driver-plan.md).
 
-The Pi 5 has a VideoCore VII GPU and a separate display pipeline (HVS, pixel valves, HDMI). The Linux `vc4` and `v3d` drivers are the reference for how those blocks work. The plan is to build up in stages, each one useful on its own:
+The Pi 5 has a VideoCore VII GPU (V3D 7.1) and a separate display pipeline (HVS, pixel valves, HDMI). The Linux drivers can't be ported line by line, because they sit on Linux's graphics stack; we re-implement their hardware behaviour for Windows' display model (WDDM). The work is staged so each step is useful on its own:
 
 | Stage | Goal | Status |
 |---|---|:---:|
-| 1. Research | Map the display and GPU blocks the ARM cores can reach from Windows, and what the UEFI firmware already sets up | 📅 |
-| 2. Display-only driver | A WDDM display-only miniport: proper mode setting, EDID, resolutions beyond the firmware default, both HDMI ports | 📅 |
-| 3. Accelerated 2D | Hardware cursor and basic acceleration | 📅 |
-| 4. 3D | Command submission to the V3D core and a user-mode driver (long term; a very large project) | 📅 |
+| 0. Probe | [`RpiGpuProbe`](driver/RpiGpuProbe) + [`gpu-acpi.patch`](firmware/gpu-acpi.patch): can Windows reach the firmware mailbox, the PM block and V3D? Reads framebuffer, EDID and clock state. | 🚧 |
+| 1. Firmware-assisted display driver | A WDDM display-only driver that takes over the screen and changes resolution through the VideoCore firmware (the way the Pi 5 UEFI driver does) | 📅 |
+| 2. Native display pipeline | Mode setting without the firmware: HVS, pixel valves, HDMI, second display | 📅 |
+| 3. 3D (V3D) | Kernel job submission and a Vulkan driver (Mesa `v3dv` port). Desktop-wide acceleration would need a separate, much larger WDDM render driver | 📅 |
 
 ---
 
@@ -139,9 +143,12 @@ Test signing is the only switch that lets a self-signed kernel driver load, and 
 |---|---|
 | [`driver/RpiEth/`](driver/RpiEth) | `RpiEthNic`, the NetAdapterCx Ethernet driver, with its [design notes](driver/RpiEth/DESIGN.md) |
 | [`driver/RpiEthProbe/`](driver/RpiEthProbe) | Early probe driver that read the GEM and PHY IDs (superseded by `RpiEthNic`) |
+| [`driver/RpiGpuProbe/`](driver/RpiGpuProbe) | Graphics stage 0: probe driver for the VideoCore mailbox, PM block and V3D (not yet compiled or run) |
 | [`firmware/rp1-eth-acpi.patch`](firmware/rp1-eth-acpi.patch) | edk2-platforms patch that exposes the RP1 MAC via ACPI |
+| [`firmware/gpu-acpi.patch`](firmware/gpu-acpi.patch) | edk2-platforms patch that exposes the mailbox, PM block and V3D via ACPI (for the GPU probe) |
 | [`firmware/rp1-eth-bringup-notes.md`](firmware/rp1-eth-bringup-notes.md) | RP1 clock, PHY and reset facts, and what was found on real hardware |
 | [`docs/install-procedure.md`](docs/install-procedure.md) | Manual DISM install and firmware-on-ESP procedure |
+| [`docs/graphics-driver-plan.md`](docs/graphics-driver-plan.md) | Graphics hardware map, staged plan and risks |
 
 ## Known build problems
 
