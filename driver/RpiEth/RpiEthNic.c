@@ -813,7 +813,7 @@ static VOID LoadSettings(PNIC_DEVICE N)
         if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NOnly, &V))) N->OnlyGigabit = V;
         {
             DECLARE_CONST_UNICODE_STRING(NPoll, L"PollSec");
-            if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NPoll, &V))) N->PollSec = V;
+            if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NPoll, &V))) N->PollSec = V ? V : 1;   /* 0 (no polling / forced link) hung boot: ignored */
             DECLARE_CONST_UNICODE_STRING(NData, L"DataPath");
             if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NData, &V))) N->DataPath = V;
         }
