@@ -639,6 +639,16 @@ static VOID EvtTxAdvance(_In_ NETPACKETQUEUE Q)
     UINT32 idx;
     BOOLEAN Posted = FALSE;
 
+    if (!(N->DataPath & 1)) {
+        /* Transmit disabled: complete and drop everything immediately so the stack never waits on us. */
+        InterlockedAdd(&N->CntTxDone, (LONG)((PR->EndIndex - PR->BeginIndex) & PR->ElementIndexMask));
+        PR->NextIndex = PR->EndIndex;
+        PR->BeginIndex = PR->EndIndex;
+        FR->NextIndex = FR->EndIndex;
+        FR->BeginIndex = FR->EndIndex;
+        return;
+    }
+
     /* Post. */
     idx = PR->NextIndex;
     while (idx != PR->EndIndex) {
