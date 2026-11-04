@@ -14,6 +14,7 @@
  */
 
 #include <ntddk.h>
+#include <ntstrsafe.h>
 #include <wdf.h>
 #include <netadaptercx.h>
 #include <net/virtualaddress.h>    /* NET_FRAGMENT_VIRTUAL_ADDRESS: copy-model data path (no framework DMA mapping) */
@@ -427,6 +428,20 @@ static VOID EvtLinkTimer(_In_ WDFTIMER Timer)
         TRACEVAL(L"GemTbqp", G(N, GEM_TBQP));
         TRACEVAL(L"GemTbqph", G(N, GEM_TBQPH));
         TRACEVAL(L"GemIsr", G(N, GEM_ISR));
+    }
+    if (N->Gem) {
+        /* GEM hardware statistics block (octets/frames sent and received, errors): publish the non-zero ones. */
+        ULONG off;
+        for (off = 0x100; off <= 0x1B0; off += 4) {
+            ULONG v = G(N, off);
+            if (v) {
+                WCHAR nm[16];
+                UNICODE_STRING us;
+                RtlStringCchPrintfW(nm, 16, L"Stat%03X", off);
+                RtlInitUnicodeString(&us, nm);
+                TraceVal(&us, v);
+            }
+        }
     }
     TRACEVAL(L"RxZero", N->CntRxZero);
     TRACEVAL(L"RxFF", N->CntRxFF);
