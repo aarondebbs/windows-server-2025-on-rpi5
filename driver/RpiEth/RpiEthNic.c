@@ -172,6 +172,8 @@ typedef struct _NIC_DEVICE {
     volatile LONG CntRxZero, CntRxFF, CntRxOther;   /* RX frame content probe: first 6 bytes all 0 / all FF / other */
     ULONG  RxSampleW[12], RxSampleCtrl, RxSampleAddr, RxSampleAddrHi; volatile LONG RxSampleSet;
     volatile LONG ProbeSet; ULONG ProbeTbqp[8], ProbeTsr[8], ProbeD0[8], ProbeD1[8];   /* TX start dynamics probe */
+    ULONG  TxScan;      /* registry TxScan: 1 = at TX start, probe which (address offset, descriptor size) makes the TX engine stop on an all-ones ring */
+    ULONG  ScN, ScHi[16], ScA64[16], ScB[16], ScS1[16], ScT1[16], ScS2[16], ScT2[16];
     ULONG  Force32;     /* registry Force32: 1 = use 32-bit (8-byte) descriptors even though the GEM supports 64-bit */
     ULONG  TxLate;      /* registry TxLate: 1 = enable TE + load TBQP only when the first frame is ready */
     BOOLEAN TeOn;
@@ -458,6 +460,21 @@ static VOID EvtLinkTimer(_In_ WDFTIMER Timer)
             RtlStringCchPrintfW(nm, 24, L"Q%u_Tsr", i);  RtlInitUnicodeString(&us, nm); TraceVal(&us, N->QTsr[i]);
         }
     }
+    TRACEVAL(L"TxScan", N->TxScan);
+    {
+        ULONG i;
+        for (i = 0; i < N->ScN && i < 12; i++) {
+            WCHAR nm[24];
+            UNICODE_STRING us;
+            RtlStringCchPrintfW(nm, 24, L"Sc%02u_Hi", i);  RtlInitUnicodeString(&us, nm); TraceVal(&us, N->ScHi[i]);
+            RtlStringCchPrintfW(nm, 24, L"Sc%02u_A64", i); RtlInitUnicodeString(&us, nm); TraceVal(&us, N->ScA64[i]);
+            RtlStringCchPrintfW(nm, 24, L"Sc%02u_B", i);   RtlInitUnicodeString(&us, nm); TraceVal(&us, N->ScB[i]);
+            RtlStringCchPrintfW(nm, 24, L"Sc%02u_S1", i);  RtlInitUnicodeString(&us, nm); TraceVal(&us, N->ScS1[i]);
+            RtlStringCchPrintfW(nm, 24, L"Sc%02u_T1", i);  RtlInitUnicodeString(&us, nm); TraceVal(&us, N->ScT1[i]);
+            RtlStringCchPrintfW(nm, 24, L"Sc%02u_S2", i);  RtlInitUnicodeString(&us, nm); TraceVal(&us, N->ScS2[i]);
+            RtlStringCchPrintfW(nm, 24, L"Sc%02u_T2", i);  RtlInitUnicodeString(&us, nm); TraceVal(&us, N->ScT2[i]);
+        }
+    }
     TRACEVAL(L"TxLate", N->TxLate);
     TRACEVAL(L"Force32", N->Force32);
     TRACEVAL(L"DmaOffHi", (ULONG)(N->DmaOffset >> 32));
@@ -711,6 +728,43 @@ static VOID EvtRxSetNotify(_In_ NETPACKETQUEUE Q, _In_ BOOLEAN Enable)
 /* TX queue: packets are copied into the driver's TX pool and the      */
 /* OS packet is completed right away; ring slots free on TXD_USED.      */
 /* ------------------------------------------------------------------ */
+/* Oracle scan. The ring is filled with all-ones, so USED (bit 31) and WRAP (bit 30) are set in every word of
+ * every possible descriptor layout. If the engine reads that ring it must halt at once (TSR.UBR, pointer fixed).
+ * We try several upper-address offsets and both descriptor sizes and record what the pointer does. */
+static VOID TxOracleScan(PNIC_DEVICE N)
+{
+    static const ULONG Cand[6] = { 0, 1, 2, 4, 8, 0x10 };
+    ULONG i, t, Dm0 = G(N, GEM_DMACFG);
+    UINT64 Base = N->TxRingLa;
+
+    for (i = 0; i < RING_SIZE * sizeof(GEM_DESC) / sizeof(ULONG); i++) ((volatile ULONG *)N->TxRing)[i] = 0xFFFFFFFFUL;
+    KeMemoryBarrier();
+    N->ScN = 0;
+    for (t = 0; t < 12; t++) {
+        ULONG hi = Cand[t >> 1], a64 = t & 1, Dm;
+        P(N, GEM_NCR, G(N, GEM_NCR) & ~NCR_TE);
+        KeStallExecutionProcessor(50);
+        P(N, GEM_TSR, 0xFFFFFFFF);
+        Dm = a64 ? (Dm0 | DMACFG_ADDR64) : (Dm0 & ~DMACFG_ADDR64);
+        P(N, GEM_DMACFG, Dm);
+        P(N, GEM_TBQP, (ULONG)Base);
+        P(N, GEM_TBQPH, (ULONG)(Base >> 32) + hi);
+        N->ScHi[t] = hi; N->ScA64[t] = a64;
+        N->ScB[t] = G(N, GEM_TBQP);
+        P(N, GEM_NCR, G(N, GEM_NCR) | NCR_TE);
+        P(N, GEM_NCR, G(N, GEM_NCR) | NCR_TSTART);
+        KeStallExecutionProcessor(20);
+        N->ScS1[t] = G(N, GEM_TBQP); N->ScT1[t] = G(N, GEM_TSR);
+        KeStallExecutionProcessor(100);
+        N->ScS2[t] = G(N, GEM_TBQP); N->ScT2[t] = G(N, GEM_TSR);
+        P(N, GEM_NCR, G(N, GEM_NCR) & ~NCR_TE);
+        N->ScN = t + 1;
+    }
+    KeStallExecutionProcessor(50);
+    P(N, GEM_TSR, 0xFFFFFFFF);
+    P(N, GEM_DMACFG, Dm0);                    /* restore the configured descriptor format */
+}
+
 static VOID EvtTxStart(_In_ NETPACKETQUEUE Q)
 {
     CB_ENTER(6);
@@ -719,6 +773,7 @@ static VOID EvtTxStart(_In_ NETPACKETQUEUE Q)
     UINT64 A = N->TxRingLa + N->DmaOffset;
 
     if (!(N->DataPath & 1) || !N->TxPool) { InterlockedIncrement(&N->CntTxStart); return; }   /* null transmit path */
+    if (N->TxScan) TxOracleScan(N);
     for (i = 0; i < RING_SIZE; i++) {
         GEM_DESC *D = TxD(N, i);
         D->Addr = 0;
@@ -744,7 +799,7 @@ static VOID EvtTxStart(_In_ NETPACKETQUEUE Q)
     N->TeOn = TRUE;
     TRACEVAL(L"TxS_TbqpTe", G(N, GEM_TBQP));
     TRACEVAL(L"TxS_TsrTe", G(N, GEM_TSR));
-    {
+    if (!N->TxScan) {
         /* Idle probe: every descriptor is software-owned, so TSTART must make the engine halt at once. */
         ULONG j;
         P(N, GEM_NCR, G(N, GEM_NCR) | NCR_TSTART);
@@ -981,6 +1036,8 @@ static VOID LoadSettings(PNIC_DEVICE N)
             if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NNoDma, &V))) N->NoDma = V;
             DECLARE_CONST_UNICODE_STRING(NDma32, L"Dma32");
             if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NDma32, &V))) N->Dma32 = V;
+            DECLARE_CONST_UNICODE_STRING(NScan, L"TxScan");
+            if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NScan, &V))) N->TxScan = V;
             DECLARE_CONST_UNICODE_STRING(NF32, L"Force32");
             if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NF32, &V))) N->Force32 = V;
             DECLARE_CONST_UNICODE_STRING(NLate, L"TxLate");
