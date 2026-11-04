@@ -1068,9 +1068,24 @@ static NTSTATUS EvtDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT Devi
     N = GetNic(Device);
     N->Device = Device;
 
-    WDF_INTERRUPT_CONFIG_INIT(&IC, EvtIsr, EvtDpc);
-    IC.AutomaticSerialization = FALSE;
-    STEP(3, WdfInterruptCreate(Device, &IC, WDF_NO_OBJECT_ATTRIBUTES, &N->Interrupt));
+    /* The RP1 ETH interrupt is only connected when the registry value EnableIrq (DWORD, Device Parameters) is non-zero.
+     * Default is OFF while we hunt the idle freeze: an interrupt that never deasserts would hang the CPU. */
+    {
+        WDFKEY K;
+        ULONG En = 0;
+        DECLARE_CONST_UNICODE_STRING(NEn, L"EnableIrq");
+        if (NT_SUCCESS(WdfDeviceOpenRegistryKey(Device, PLUGPLAY_REGKEY_DEVICE, KEY_READ,
+                                                WDF_NO_OBJECT_ATTRIBUTES, &K))) {
+            (VOID)WdfRegistryQueryULong(K, &NEn, &En);
+            WdfRegistryClose(K);
+        }
+        TRACEVAL(L"EnableIrq", En);
+        if (En) {
+            WDF_INTERRUPT_CONFIG_INIT(&IC, EvtIsr, EvtDpc);
+            IC.AutomaticSerialization = FALSE;
+            STEP(3, WdfInterruptCreate(Device, &IC, WDF_NO_OBJECT_ATTRIBUTES, &N->Interrupt));
+        }
+    }
 
     WDF_TIMER_CONFIG_INIT(&TC, EvtLinkTimer);      /* one-shot, re-armed by the callback */
     TC.AutomaticSerialization = FALSE;
