@@ -162,6 +162,7 @@ typedef struct _NIC_DEVICE {
     volatile BOOLEAN Polling;
     USHORT DbgBmsr, DbgLpa, Dbg1000St, DbgAux19, DbgBmcr;
     ULONG  PollCount;
+    ULONG  Bisect;      /* registry Bisect: 1 = skip MAC speed write on link-up, 2 = never publish link-up to Windows */
     ULONG  PollSec;     /* registry PollSec: link poll interval in seconds, 0 = no polling (link forced up at 1000/full) */
     volatile LONG CntTxStart, CntRxStart, CntTxPosted, CntTxDone, CntRxDone;  /* data-path counters, published by the link timer */
     volatile LONG Crumb;   /* stop-path breadcrumbs: 1 RxStop 2 RxCancel 4 TxStop 8 TxCancel 0x10 D0Exit 0x20 timer stopped 0x40 D0Exit done 0x80 ReleaseHw */
@@ -419,12 +420,16 @@ static VOID EvtLinkTimer(_In_ WDFTIMER Timer)
     TRACEVAL(L"Phy1000St", N->Dbg1000St);
     TRACEVAL(L"PhyAux19", N->DbgAux19);
     if (Up != N->LinkUp || (Up && Mbps != N->LinkMbps)) {
-        if (Up) SetMacSpeed(N, Mbps, Full);
-        N->LinkUp = Up;
-        N->LinkMbps = Mbps;
         TRACEVAL(L"LinkUp", Up);
         TRACEVAL(L"LinkMbps", Mbps);
-        PublishLink(N, Up, Mbps, Full);
+        TraceFlush();
+        if (Up && !(N->Bisect & 1)) SetMacSpeed(N, Mbps, Full);
+        N->LinkUp = Up;
+        N->LinkMbps = Mbps;
+        TRACEVAL(L"LinkStage", 1);          /* reached after the MAC speed write */
+        TraceFlush();
+        if (!(N->Bisect & 2)) PublishLink(N, Up, Mbps, Full);
+        TRACEVAL(L"LinkStage", 2);          /* reached after telling Windows */
     }
     TraceFlush();                                 /* one flush per second so the values survive a hang */
     if (N->Polling) WdfTimerStart(Timer, WDF_REL_TIMEOUT_IN_SEC(N->PollSec ? N->PollSec : 1));
@@ -827,6 +832,8 @@ static VOID LoadSettings(PNIC_DEVICE N)
         }
         if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NOnly, &V))) N->OnlyGigabit = V;
         {
+            DECLARE_CONST_UNICODE_STRING(NBis, L"Bisect");
+            if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NBis, &V))) N->Bisect = V;
             DECLARE_CONST_UNICODE_STRING(NPoll, L"PollSec");
             if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NPoll, &V))) N->PollSec = V ? V : 1;   /* 0 (no polling / forced link) hung boot: ignored */
             DECLARE_CONST_UNICODE_STRING(NData, L"DataPath");
