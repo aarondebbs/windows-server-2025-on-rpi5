@@ -494,6 +494,7 @@ static VOID EvtRxStart(_In_ NETPACKETQUEUE Q)
     ULONG i;
     UINT64 A = N->RxRingLa + N->DmaOffset;
 
+    if (!(N->DataPath & 2)) { InterlockedIncrement(&N->CntRxStart); return; }   /* null receive path */
     for (i = 0; i < RING_SIZE; i++) {
         GEM_DESC *D = RxD(N, i);
         D->Ctrl = 0;
@@ -525,6 +526,8 @@ static VOID EvtRxAdvance(_In_ NETPACKETQUEUE Q)
     UINT32 pi = PR->BeginIndex;
     UINT32 fi = FR->BeginIndex;
     UINT32 fEnd = FR->NextIndex;          /* fragments already posted to hw */
+
+    if (!(N->DataPath & 2)) return;       /* null receive path: no ring work, no hardware */
 
     /* Indicate received frames. */
     while (fi != fEnd) {
@@ -609,6 +612,7 @@ static VOID EvtTxStart(_In_ NETPACKETQUEUE Q)
     ULONG i;
     UINT64 A = N->TxRingLa + N->DmaOffset;
 
+    if (!(N->DataPath & 1)) { InterlockedIncrement(&N->CntTxStart); return; }   /* null transmit path */
     for (i = 0; i < RING_SIZE; i++) {
         GEM_DESC *D = TxD(N, i);
         D->Addr = 0;
