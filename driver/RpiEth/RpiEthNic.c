@@ -361,7 +361,8 @@ static VOID SetMacSpeed(PNIC_DEVICE N, ULONG Mbps, BOOLEAN Full)
 
     /* RGMII TX clock must follow the speed. ASSUMPTION: clk_eth runs from a
      * 125 MHz source and DIV is an integer divider. NOT verified. */
-    if (N->Clk != NULL && N->ClkLen > CLK_ETH_DIV + 4) {
+    /* 1000 Mbit: firmware/boot code already leaves DIV=1, do not touch the RP1 clock block. */
+    if (Mbps != 1000 && N->Clk != NULL && N->ClkLen > CLK_ETH_DIV + 4) {
         Wr(N->Clk, CLK_ETH_DIV, Mbps == 1000 ? 1 : (Mbps == 100 ? 5 : 50));
     }
 }
