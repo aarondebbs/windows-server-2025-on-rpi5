@@ -534,7 +534,12 @@ static VOID EvtRxAdvance(_In_ NETPACKETQUEUE Q)
     UINT32 fi = FR->BeginIndex;
     UINT32 fEnd = FR->NextIndex;          /* fragments already posted to hw */
 
-    if (!(N->DataPath & 2)) return;       /* null receive path: no ring work, no hardware */
+    if (!(N->DataPath & 2)) {
+        /* Null receive path: take ownership of every buffer Windows offers (as if posted to hardware that never
+         * delivers). Leaving them unclaimed makes the framework call Advance in a tight DPC loop. */
+        FR->NextIndex = FR->EndIndex;
+        return;
+    }
 
     /* Indicate received frames. */
     while (fi != fEnd) {
