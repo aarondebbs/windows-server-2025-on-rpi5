@@ -167,6 +167,7 @@ typedef struct _NIC_DEVICE {
     ULONG  PollCount;
     ULONG  NoDma;       /* registry NoDma: 0/2 = copy model (DMA enabler + driver-owned rings and buffers, non-DMA caps), 1 = no DMA objects at all (null data path) */
     ULONG  Bisect;      /* registry Bisect: 1 = skip MAC speed write on link-up, 2 = never publish link-up to Windows */
+    ULONG  Dma32;       /* registry Dma32 (default 1): keep every driver DMA buffer below 4 GB */
     ULONG  PollSec;     /* registry PollSec: link poll interval in seconds, 0 = no polling (link forced up at 1000/full) */
     volatile LONG CntTxStart, CntRxStart, CntTxPosted, CntTxDone, CntRxDone;  /* data-path counters, published by the link timer */
     volatile LONG Crumb;   /* stop-path breadcrumbs: 1 RxStop 2 RxCancel 4 TxStop 8 TxCancel 0x10 D0Exit 0x20 timer stopped 0x40 D0Exit done 0x80 ReleaseHw */
@@ -431,6 +432,13 @@ static VOID EvtLinkTimer(_In_ WDFTIMER Timer)
         TRACEVAL(L"TxPost", N->TxPost);
         TRACEVAL(L"TxClean", N->TxClean);
         TRACEVAL(L"TxRingLaLo", (ULONG)N->TxRingLa);
+        TRACEVAL(L"TxRingLaHi", (ULONG)(N->TxRingLa >> 32));
+        TRACEVAL(L"TxPoolLaHi", (ULONG)(N->TxPoolLa >> 32));
+        TRACEVAL(L"RxRingLaLo", (ULONG)N->RxRingLa);
+        TRACEVAL(L"RxRingLaHi", (ULONG)(N->RxRingLa >> 32));
+        TRACEVAL(L"RxPoolLaLo", (ULONG)N->RxPoolLa);
+        TRACEVAL(L"RxPoolLaHi", (ULONG)(N->RxPoolLa >> 32));
+        TRACEVAL(L"Dma32", N->Dma32);
         TRACEVAL(L"TxPoolLaLo", (ULONG)N->TxPoolLa);
     }
     if (N->Clk && N->ClkLen > 0x70) {
@@ -847,6 +855,7 @@ static VOID LoadSettings(PNIC_DEVICE N)
     N->OnlyGigabit = 1;
     N->DataPath = 0;
     N->PollSec = 1;
+    N->Dma32 = 1;
 
     if (!NT_SUCCESS(WdfDeviceOpenRegistryKey(N->Device, PLUGPLAY_REGKEY_DEVICE,
                                              KEY_ALL_ACCESS, WDF_NO_OBJECT_ATTRIBUTES, &Key))) {
@@ -862,6 +871,8 @@ static VOID LoadSettings(PNIC_DEVICE N)
         {
             DECLARE_CONST_UNICODE_STRING(NNoDma, L"NoDma");
             if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NNoDma, &V))) N->NoDma = V;
+            DECLARE_CONST_UNICODE_STRING(NDma32, L"Dma32");
+            if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NDma32, &V))) N->Dma32 = V;
             DECLARE_CONST_UNICODE_STRING(NBis, L"Bisect");
             if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NBis, &V))) N->Bisect = V;
             DECLARE_CONST_UNICODE_STRING(NPoll, L"PollSec");
@@ -1014,7 +1025,7 @@ static NTSTATUS EvtPrepareHardware(_In_ WDFDEVICE Device, _In_ WDFCMRESLIST Raw,
         TRACEVAL(L"GemModuleIdSeen", G(N, GEM_MID));
     }
     if (N->NoDma != 1) {
-        WDF_DMA_ENABLER_CONFIG_INIT(&DC, N->Addr64 ? WdfDmaProfileScatterGather64 : WdfDmaProfileScatterGather, 0x10000);
+        WDF_DMA_ENABLER_CONFIG_INIT(&DC, (N->Addr64 && !N->Dma32) ? WdfDmaProfileScatterGather64 : WdfDmaProfileScatterGather, 0x10000);
         DC.WdmDmaVersionOverride = 3;
         STEP(13, WdfDmaEnablerCreate(Device, &DC, WDF_NO_OBJECT_ATTRIBUTES, &N->Dma));
         STEP(14, CreateRings(N));
