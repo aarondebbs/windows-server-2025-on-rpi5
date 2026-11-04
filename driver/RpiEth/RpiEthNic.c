@@ -172,6 +172,7 @@ typedef struct _NIC_DEVICE {
     volatile LONG CntRxZero, CntRxFF, CntRxOther;   /* RX frame content probe: first 6 bytes all 0 / all FF / other */
     ULONG  RxSampleW[12], RxSampleCtrl, RxSampleAddr, RxSampleAddrHi; volatile LONG RxSampleSet;
     volatile LONG ProbeSet; ULONG ProbeTbqp[8], ProbeTsr[8], ProbeD0[8], ProbeD1[8];   /* TX start dynamics probe */
+    ULONG  Force32;     /* registry Force32: 1 = use 32-bit (8-byte) descriptors even though the GEM supports 64-bit */
     ULONG  TxLate;      /* registry TxLate: 1 = enable TE + load TBQP only when the first frame is ready */
     BOOLEAN TeOn;
     ULONG  QTbqp[4], QTsr[4];   /* idle-TSTART probe at TX start */
@@ -458,6 +459,8 @@ static VOID EvtLinkTimer(_In_ WDFTIMER Timer)
         }
     }
     TRACEVAL(L"TxLate", N->TxLate);
+    TRACEVAL(L"Force32", N->Force32);
+    TRACEVAL(L"DmaOffHi", (ULONG)(N->DmaOffset >> 32));
     if (N->ProbeSet) {
         ULONG i;
         for (i = 0; i < 8; i++) {
@@ -978,6 +981,8 @@ static VOID LoadSettings(PNIC_DEVICE N)
             if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NNoDma, &V))) N->NoDma = V;
             DECLARE_CONST_UNICODE_STRING(NDma32, L"Dma32");
             if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NDma32, &V))) N->Dma32 = V;
+            DECLARE_CONST_UNICODE_STRING(NF32, L"Force32");
+            if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NF32, &V))) N->Force32 = V;
             DECLARE_CONST_UNICODE_STRING(NLate, L"TxLate");
             if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NLate, &V))) N->TxLate = V;
             DECLARE_CONST_UNICODE_STRING(NBis, L"Bisect");
@@ -1129,7 +1134,7 @@ static NTSTATUS EvtPrepareHardware(_In_ WDFDEVICE Device, _In_ WDFCMRESLIST Raw,
      * what we read and never guess. */
     {
         ULONG D6 = G(N, GEM_DCFG6);
-        N->Addr64 = (D6 & DCFG6_DAW64) ? TRUE : FALSE;
+        N->Addr64 = ((D6 & DCFG6_DAW64) && !N->Force32) ? TRUE : FALSE;
         N->DescStride = N->Addr64 ? 16 : 8;
         TRACEVAL(L"GemDcfg1", G(N, GEM_DCFG1));
         TRACEVAL(L"GemDcfg6", D6);
