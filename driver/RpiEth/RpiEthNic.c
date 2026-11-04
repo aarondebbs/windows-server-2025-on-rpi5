@@ -162,6 +162,7 @@ typedef struct _NIC_DEVICE {
     volatile BOOLEAN Polling;
     USHORT DbgBmsr, DbgLpa, Dbg1000St, DbgAux19, DbgBmcr;
     ULONG  PollCount;
+    ULONG  NoDma;       /* registry NoDma=1: set up adapter without DMA (like the netvadapter sample); idle path only */
     ULONG  Bisect;      /* registry Bisect: 1 = skip MAC speed write on link-up, 2 = never publish link-up to Windows */
     ULONG  PollSec;     /* registry PollSec: link poll interval in seconds, 0 = no polling (link forced up at 1000/full) */
     volatile LONG CntTxStart, CntRxStart, CntTxPosted, CntTxDone, CntRxDone;  /* data-path counters, published by the link timer */
@@ -768,7 +769,7 @@ static NTSTATUS EvtCreateRxQueue(_In_ NETADAPTER Adapter, _Inout_ NETRXQUEUE_INI
     NET_EXTENSION_QUERY_INIT(&Ext, NET_FRAGMENT_EXTENSION_LOGICAL_ADDRESS_NAME,
                              NET_FRAGMENT_EXTENSION_LOGICAL_ADDRESS_VERSION_1,
                              NetExtensionTypeFragment);
-    NetRxQueueGetExtension(Q, &Ext, &C->LogAddr);
+    if (!C->Nic->NoDma) NetRxQueueGetExtension(Q, &Ext, &C->LogAddr);
     C->Nic->RxQueue = Q;
     return STATUS_SUCCESS;
 }
@@ -796,7 +797,7 @@ static NTSTATUS EvtCreateTxQueue(_In_ NETADAPTER Adapter, _Inout_ NETTXQUEUE_INI
     NET_EXTENSION_QUERY_INIT(&Ext, NET_FRAGMENT_EXTENSION_LOGICAL_ADDRESS_NAME,
                              NET_FRAGMENT_EXTENSION_LOGICAL_ADDRESS_VERSION_1,
                              NetExtensionTypeFragment);
-    NetTxQueueGetExtension(Q, &Ext, &C->LogAddr);
+    if (!C->Nic->NoDma) NetTxQueueGetExtension(Q, &Ext, &C->LogAddr);
     C->Nic->TxQueue = Q;
     return STATUS_SUCCESS;
 }
@@ -839,6 +840,8 @@ static VOID LoadSettings(PNIC_DEVICE N)
         }
         if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NOnly, &V))) N->OnlyGigabit = V;
         {
+            DECLARE_CONST_UNICODE_STRING(NNoDma, L"NoDma");
+            if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NNoDma, &V))) N->NoDma = V;
             DECLARE_CONST_UNICODE_STRING(NBis, L"Bisect");
             if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NBis, &V))) N->Bisect = V;
             DECLARE_CONST_UNICODE_STRING(NPoll, L"PollSec");
@@ -907,15 +910,25 @@ static NTSTATUS SetCapabilities(PNIC_DEVICE N)
     NET_ADAPTER_RECEIVE_FILTER_CAPABILITIES RF;
     NET_ADAPTER_LINK_LAYER_ADDRESS Addr;
 
-    NET_ADAPTER_DMA_CAPABILITIES_INIT(&TxDma, N->Dma);
-    NET_ADAPTER_TX_CAPABILITIES_INIT_FOR_DMA(&Tx, &TxDma, 1);
-    Tx.MaximumNumberOfFragments = 1;
-    Tx.FragmentRingNumberOfElementsHint = RING_SIZE;
+    if (N->NoDma) {
+        NET_ADAPTER_TX_CAPABILITIES_INIT(&Tx, 1);
+        Tx.MaximumNumberOfFragments = 1;
+        Tx.FragmentRingNumberOfElementsHint = RING_SIZE;
+        NET_ADAPTER_RX_CAPABILITIES_INIT_SYSTEM_MANAGED(&Rx, RX_BUF_SIZE, 1);
+        Rx.FragmentBufferAlignment = 64;
+        Rx.FragmentRingNumberOfElementsHint = RING_SIZE;
+        UNREFERENCED_PARAMETER(TxDma); UNREFERENCED_PARAMETER(RxDma);
+    } else {
+        NET_ADAPTER_DMA_CAPABILITIES_INIT(&TxDma, N->Dma);
+        NET_ADAPTER_TX_CAPABILITIES_INIT_FOR_DMA(&Tx, &TxDma, 1);
+        Tx.MaximumNumberOfFragments = 1;
+        Tx.FragmentRingNumberOfElementsHint = RING_SIZE;
 
-    NET_ADAPTER_DMA_CAPABILITIES_INIT(&RxDma, N->Dma);
-    NET_ADAPTER_RX_CAPABILITIES_INIT_SYSTEM_MANAGED_DMA(&Rx, &RxDma, RX_BUF_SIZE, 1);
-    Rx.FragmentBufferAlignment = 64;
-    Rx.FragmentRingNumberOfElementsHint = RING_SIZE;
+        NET_ADAPTER_DMA_CAPABILITIES_INIT(&RxDma, N->Dma);
+        NET_ADAPTER_RX_CAPABILITIES_INIT_SYSTEM_MANAGED_DMA(&Rx, &RxDma, RX_BUF_SIZE, 1);
+        Rx.FragmentBufferAlignment = 64;
+        Rx.FragmentRingNumberOfElementsHint = RING_SIZE;
+    }
 
     NET_ADAPTER_LINK_LAYER_CAPABILITIES_INIT(&LL, 1000000000ULL, 1000000000ULL);
     NetAdapterSetLinkLayerCapabilities(N->Adapter, &LL);
@@ -977,10 +990,12 @@ static NTSTATUS EvtPrepareHardware(_In_ WDFDEVICE Device, _In_ WDFCMRESLIST Raw,
         TRACEVAL(L"GemAddr64", N->Addr64);
         TRACEVAL(L"GemModuleIdSeen", G(N, GEM_MID));
     }
-    WDF_DMA_ENABLER_CONFIG_INIT(&DC, N->Addr64 ? WdfDmaProfileScatterGather64 : WdfDmaProfileScatterGather, 0x10000);
-    DC.WdmDmaVersionOverride = 3;
-    STEP(13, WdfDmaEnablerCreate(Device, &DC, WDF_NO_OBJECT_ATTRIBUTES, &N->Dma));
-    STEP(14, CreateRings(N));
+    if (!N->NoDma) {
+        WDF_DMA_ENABLER_CONFIG_INIT(&DC, N->Addr64 ? WdfDmaProfileScatterGather64 : WdfDmaProfileScatterGather, 0x10000);
+        DC.WdmDmaVersionOverride = 3;
+        STEP(13, WdfDmaEnablerCreate(Device, &DC, WDF_NO_OBJECT_ATTRIBUTES, &N->Dma));
+        STEP(14, CreateRings(N));
+    }
     SetCapabilities(N);
     Trace(15, STATUS_SUCCESS);
     S = NetAdapterStart(N->Adapter);
