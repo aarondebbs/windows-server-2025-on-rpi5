@@ -16,7 +16,7 @@
 #include <ntddk.h>
 #include <wdf.h>
 #include <netadaptercx.h>
-#include <net/logicaladdress.h>   /* NET_FRAGMENT_LOGICAL_ADDRESS (not pulled in by netadaptercx.h) */
+#include <net/virtualaddress.h>    /* NET_FRAGMENT_VIRTUAL_ADDRESS: copy-model data path (no framework DMA mapping) */
 
 #define NIC_TAG 'ciNR'
 
@@ -143,6 +143,9 @@ typedef struct _NIC_DEVICE {
     WDFCOMMONBUFFER RxRingBuf, TxRingBuf;
     GEM_DESC       *RxRing, *TxRing;
     UINT64          RxRingLa, TxRingLa;
+    WDFCOMMONBUFFER RxPoolBuf, TxPoolBuf;      /* driver-owned packet buffers, RING_SIZE * RX_BUF_SIZE each */
+    PUCHAR          RxPool, TxPool;
+    UINT64          RxPoolLa, TxPoolLa;
 
     WDFINTERRUPT    Interrupt;
     WDFTIMER        LinkTimer;
@@ -162,7 +165,7 @@ typedef struct _NIC_DEVICE {
     volatile BOOLEAN Polling;
     USHORT DbgBmsr, DbgLpa, Dbg1000St, DbgAux19, DbgBmcr;
     ULONG  PollCount;
-    ULONG  NoDma;       /* registry NoDma: 0 = full DMA, 1 = no DMA at all, 2 = DMA enabler + rings but non-DMA caps, 3 = TX DMA caps only, 4 = RX DMA caps only (idle-path tests) */
+    ULONG  NoDma;       /* registry NoDma: 0/2 = copy model (DMA enabler + driver-owned rings and buffers, non-DMA caps), 1 = no DMA objects at all (null data path) */
     ULONG  Bisect;      /* registry Bisect: 1 = skip MAC speed write on link-up, 2 = never publish link-up to Windows */
     ULONG  PollSec;     /* registry PollSec: link poll interval in seconds, 0 = no polling (link forced up at 1000/full) */
     volatile LONG CntTxStart, CntRxStart, CntTxPosted, CntTxDone, CntRxDone;  /* data-path counters, published by the link timer */
@@ -178,7 +181,7 @@ WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(ADAPTER_CTX, GetAdapterCtx)
 typedef struct _QUEUE_CTX {
     PNIC_DEVICE Nic;
     NET_RING_COLLECTION const *Rings;
-    NET_EXTENSION LogAddr;
+    NET_EXTENSION VaExt;
 } QUEUE_CTX;
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(QUEUE_CTX, GetQueueCtx)
 
@@ -483,17 +486,20 @@ static GEM_DESC *TxD(PNIC_DEVICE N, ULONG i)
     return (GEM_DESC *)((PUCHAR)N->TxRing + (i % RING_SIZE) * N->DescStride);
 }
 
-static VOID SetDescAddr(PNIC_DEVICE N, GEM_DESC *D, UINT64 La, ULONG Flags)
+static VOID RxArm(PNIC_DEVICE N, ULONG i)
 {
-    UINT64 A = La + N->DmaOffset;
+    /* Point descriptor i at its slot in the driver-owned RX pool and hand it to the hardware. */
+    GEM_DESC *D = RxD(N, i);
+    UINT64 A = N->RxPoolLa + (UINT64)(i % RING_SIZE) * RX_BUF_SIZE + N->DmaOffset;
     if (N->Addr64) D->AddrHi = (ULONG)(A >> 32);   /* never write it in 32-bit mode: it aliases the next descriptor */
     D->Ctrl = 0;
     KeMemoryBarrier();
-    D->Addr = (ULONG)(A & 0xFFFFFFFCUL) | Flags;
+    D->Addr = (ULONG)(A & 0xFFFFFFFCUL) | (((i % RING_SIZE) == RING_SIZE - 1) ? RXD_WRAP : 0);
 }
 
 /* ------------------------------------------------------------------ */
-/* RX queue                                                           */
+/* RX queue: hardware fills the driver's own pool; frames are copied   */
+/* into the OS fragments (copy model, no framework DMA mapping).       */
 /* ------------------------------------------------------------------ */
 static VOID EvtRxStart(_In_ NETPACKETQUEUE Q)
 {
@@ -502,18 +508,13 @@ static VOID EvtRxStart(_In_ NETPACKETQUEUE Q)
     ULONG i;
     UINT64 A = N->RxRingLa + N->DmaOffset;
 
-    if (!(N->DataPath & 2)) { InterlockedIncrement(&N->CntRxStart); return; }   /* null receive path */
-    for (i = 0; i < RING_SIZE; i++) {
-        GEM_DESC *D = RxD(N, i);
-        D->Ctrl = 0;
-        if (N->Addr64) D->AddrHi = 0;
-        D->Addr = RXD_USED | (i == RING_SIZE - 1 ? RXD_WRAP : 0);  /* sw owned */
-    }
+    if (!(N->DataPath & 2) || !N->RxPool) { InterlockedIncrement(&N->CntRxStart); return; }   /* null receive path */
+    for (i = 0; i < RING_SIZE; i++) RxArm(N, i);
     N->RxPost = N->RxClean = 0;
     P(N, GEM_RBQP, (ULONG)A);
     if (N->Addr64) P(N, GEM_RBQPH, (ULONG)(A >> 32));
     InterlockedIncrement(&N->CntRxStart);
-    if (N->DataPath & 2) P(N, GEM_NCR, G(N, GEM_NCR) | NCR_RE);
+    P(N, GEM_NCR, G(N, GEM_NCR) | NCR_RE);
 }
 
 static VOID EvtRxStop(_In_ NETPACKETQUEUE Q)
@@ -533,32 +534,43 @@ static VOID EvtRxAdvance(_In_ NETPACKETQUEUE Q)
     NET_RING *FR = NetRingCollectionGetFragmentRing(C->Rings);
     UINT32 pi = PR->BeginIndex;
     UINT32 fi = FR->BeginIndex;
-    UINT32 fEnd = FR->NextIndex;          /* fragments already posted to hw */
 
-    if (!(N->DataPath & 2)) return;       /* null receive path: nothing to do, like the sample when no frame arrived */
+    if (!(N->DataPath & 2) || !N->RxPool || !C->VaExt.Enabled) return;   /* null receive path */
 
-    /* Indicate received frames. */
-    while (fi != fEnd) {
+    /* Each received frame needs one free packet element and one free OS fragment. */
+    while (fi != FR->EndIndex && pi != PR->EndIndex) {
         GEM_DESC *D = RxD(N, N->RxClean);
         NET_FRAGMENT *F;
         NET_PACKET *Pk;
-        ULONG Ctrl;
+        ULONG Ctrl, Len;
+        NET_FRAGMENT_VIRTUAL_ADDRESS *Va;
 
-        if (!(D->Addr & RXD_USED)) break;           /* hw not done */
+        if (!(D->Addr & RXD_USED)) break;            /* hw not done */
         KeMemoryBarrier();
         Ctrl = D->Ctrl;
+        Len = RXD_LEN(Ctrl);
 
         F = NetRingGetFragmentAtIndex(FR, fi);
         Pk = NetRingGetPacketAtIndex(PR, pi);
-        F->Offset = 0;
-        F->ValidLength = RXD_LEN(Ctrl);
+        Va = NetExtensionGetFragmentVirtualAddress(&C->VaExt, fi);
+
+        if ((Ctrl & (RXD_SOF | RXD_EOF)) == (RXD_SOF | RXD_EOF) && Len != 0 &&
+            Len <= RX_BUF_SIZE && Len <= F->Capacity && Va && Va->VirtualAddress) {
+            RtlCopyMemory((PUCHAR)Va->VirtualAddress,
+                          N->RxPool + (SIZE_T)(N->RxClean % RING_SIZE) * RX_BUF_SIZE, Len);
+            F->Offset = 0;
+            F->ValidLength = Len;
+            Pk->Ignore = 0;
+        } else {
+            F->Offset = 0;
+            F->ValidLength = 0;
+            Pk->Ignore = 1;                          /* split, empty or oversize frame: drop */
+        }
         Pk->FragmentIndex = fi;
         Pk->FragmentCount = 1;
         RtlZeroMemory(&Pk->Layout, sizeof(Pk->Layout));
-        if ((Ctrl & (RXD_SOF | RXD_EOF)) != (RXD_SOF | RXD_EOF) || F->ValidLength == 0) {
-            Pk->Ignore = 1;                          /* split or empty frame: drop */
-        }
 
+        RxArm(N, N->RxClean);                        /* give the slot straight back to the hardware */
         N->RxClean++;
         InterlockedIncrement(&N->CntRxDone);
         fi = NetRingIncrementIndex(FR, fi);
@@ -566,22 +578,6 @@ static VOID EvtRxAdvance(_In_ NETPACKETQUEUE Q)
     }
     FR->BeginIndex = fi;
     PR->BeginIndex = pi;
-
-    /* Post new buffers. */
-    fi = FR->NextIndex;
-    fEnd = FR->EndIndex;
-    while (fi != fEnd && (N->RxPost - N->RxClean) < RING_SIZE) {
-        GEM_DESC *D = RxD(N, N->RxPost);
-        NET_FRAGMENT *F = NetRingGetFragmentAtIndex(FR, fi);
-        NET_FRAGMENT_LOGICAL_ADDRESS *LA =
-            NetExtensionGetFragmentLogicalAddress(&C->LogAddr, fi);
-
-        SetDescAddr(N, D, LA->LogicalAddress + F->Offset,
-                    ((N->RxPost % RING_SIZE) == RING_SIZE - 1) ? RXD_WRAP : 0);
-        N->RxPost++;
-        fi = NetRingIncrementIndex(FR, fi);
-    }
-    FR->NextIndex = fi;
     P(N, GEM_RSR, RSR_BNA);                          /* resume if it had stalled */
 }
 
@@ -611,7 +607,8 @@ static VOID EvtRxSetNotify(_In_ NETPACKETQUEUE Q, _In_ BOOLEAN Enable)
 }
 
 /* ------------------------------------------------------------------ */
-/* TX queue (one fragment per packet: MaximumNumberOfFragments = 1)   */
+/* TX queue: packets are copied into the driver's TX pool and the      */
+/* OS packet is completed right away; ring slots free on TXD_USED.      */
 /* ------------------------------------------------------------------ */
 static VOID EvtTxStart(_In_ NETPACKETQUEUE Q)
 {
@@ -620,7 +617,7 @@ static VOID EvtTxStart(_In_ NETPACKETQUEUE Q)
     ULONG i;
     UINT64 A = N->TxRingLa + N->DmaOffset;
 
-    if (!(N->DataPath & 1)) { InterlockedIncrement(&N->CntTxStart); return; }   /* null transmit path */
+    if (!(N->DataPath & 1) || !N->TxPool) { InterlockedIncrement(&N->CntTxStart); return; }   /* null transmit path */
     for (i = 0; i < RING_SIZE; i++) {
         GEM_DESC *D = TxD(N, i);
         D->Addr = 0;
@@ -631,7 +628,7 @@ static VOID EvtTxStart(_In_ NETPACKETQUEUE Q)
     P(N, GEM_TBQP, (ULONG)A);
     if (N->Addr64) P(N, GEM_TBQPH, (ULONG)(A >> 32));
     InterlockedIncrement(&N->CntTxStart);
-    if (N->DataPath & 1) P(N, GEM_NCR, G(N, GEM_NCR) | NCR_TE);
+    P(N, GEM_NCR, G(N, GEM_NCR) | NCR_TE);
 }
 
 static VOID EvtTxStop(_In_ NETPACKETQUEUE Q)
@@ -649,75 +646,67 @@ static VOID EvtTxAdvance(_In_ NETPACKETQUEUE Q)
     PNIC_DEVICE N = C->Nic;
     NET_RING *PR = NetRingCollectionGetPacketRing(C->Rings);
     NET_RING *FR = NetRingCollectionGetFragmentRing(C->Rings);
-    UINT32 idx;
+    UINT32 pi;
     BOOLEAN Posted = FALSE;
+    BOOLEAN Live = (N->DataPath & 1) && N->TxPool && C->VaExt.Enabled;
 
-    if (!(N->DataPath & 1)) {
-        /* Transmit disabled: complete and drop every packet exactly like Microsoft's netvadapter sample
-         * (iterators only; NextIndex is never touched). */
-        UINT32 pi;
-        for (pi = PR->BeginIndex; pi != PR->EndIndex; pi = NetRingIncrementIndex(PR, pi)) {
-            NET_PACKET *Pk = NetRingGetPacketAtIndex(PR, pi);
-            UINT32 f = Pk->FragmentIndex, k;
-            for (k = 0; k < Pk->FragmentCount; k++) f = NetRingIncrementIndex(FR, f);
-            FR->BeginIndex = f;
-            InterlockedIncrement(&N->CntTxDone);
-        }
-        PR->BeginIndex = PR->EndIndex;
-        return;
-    }
-
-    /* Post. */
-    idx = PR->NextIndex;
-    while (idx != PR->EndIndex) {
-        NET_PACKET *Pk = NetRingGetPacketAtIndex(PR, idx);
-        if (!Pk->Ignore) {
-            GEM_DESC *D = TxD(N, N->TxPost);
-            NET_FRAGMENT *F;
-            NET_FRAGMENT_LOGICAL_ADDRESS *LA;
-            UINT64 A;
-
-            if (!(D->Ctrl & TXD_USED)) break;           /* ring full */
-            F = NetRingGetFragmentAtIndex(FR, Pk->FragmentIndex);
-            LA = NetExtensionGetFragmentLogicalAddress(&C->LogAddr, Pk->FragmentIndex);
-            A = LA->LogicalAddress + F->Offset + N->DmaOffset;
-
-            D->Addr = (ULONG)A;
-            if (N->Addr64) D->AddrHi = (ULONG)(A >> 32);
-            KeMemoryBarrier();
-            D->Ctrl = TXD_LEN(F->ValidLength) | TXD_LAST |
-                      (((N->TxPost % RING_SIZE) == RING_SIZE - 1) ? TXD_WRAP : 0);
-            N->TxPost++;
-            InterlockedIncrement(&N->CntTxPosted);
-            FR->NextIndex = NetRingIncrementIndex(FR, Pk->FragmentIndex);
-            Posted = TRUE;
-        }
-        idx = NetRingIncrementIndex(PR, idx);
-    }
-    PR->NextIndex = idx;
-    if (Posted && (N->DataPath & 1)) {
-        KeMemoryBarrier();
-        P(N, GEM_NCR, G(N, GEM_NCR) | NCR_TSTART);
-    }
-
-    /* Drain completed. */
-    idx = PR->BeginIndex;
-    while (idx != PR->NextIndex) {
-        NET_PACKET *Pk = NetRingGetPacketAtIndex(PR, idx);
-        UINT32 k, f;
-
-        if (!Pk->Ignore) {
-            if (N->TxClean == N->TxPost) break;
-            if (!(TxD(N, N->TxClean)->Ctrl & TXD_USED)) break;
+    /* Reclaim descriptors the hardware has finished with. */
+    if (Live) {
+        while (N->TxClean != N->TxPost && (TxD(N, N->TxClean)->Ctrl & TXD_USED)) {
             N->TxClean++;
             InterlockedIncrement(&N->CntTxDone);
         }
-        f = Pk->FragmentIndex;
-        for (k = 0; k < Pk->FragmentCount; k++) f = NetRingIncrementIndex(FR, f);
-        FR->BeginIndex = f;
-        idx = NetRingIncrementIndex(PR, idx);
     }
-    PR->BeginIndex = idx;
+
+    for (pi = PR->BeginIndex; pi != PR->EndIndex; pi = NetRingIncrementIndex(PR, pi)) {
+        NET_PACKET *Pk = NetRingGetPacketAtIndex(PR, pi);
+        UINT32 f = Pk->FragmentIndex, k;
+        ULONG Total = 0;
+        GEM_DESC *D = NULL;
+        PUCHAR Slot = NULL;
+        BOOLEAN Ok = Live && !Pk->Ignore;
+
+        if (Ok) {
+            D = TxD(N, N->TxPost);
+            if (!(D->Ctrl & TXD_USED)) break;        /* TX ring full: leave this packet for the next advance */
+            Slot = N->TxPool + (SIZE_T)(N->TxPost % RING_SIZE) * RX_BUF_SIZE;
+        }
+
+        for (k = 0; k < Pk->FragmentCount; k++) {
+            NET_FRAGMENT *F = NetRingGetFragmentAtIndex(FR, f);
+            if (Ok) {
+                NET_FRAGMENT_VIRTUAL_ADDRESS *Va = NetExtensionGetFragmentVirtualAddress(&C->VaExt, f);
+                if (!Va || !Va->VirtualAddress || Total + F->ValidLength > RX_BUF_SIZE) {
+                    Ok = FALSE;                      /* unusable or oversize: drop */
+                } else {
+                    RtlCopyMemory(Slot + Total, (PUCHAR)Va->VirtualAddress + F->Offset, F->ValidLength);
+                    Total += (ULONG)F->ValidLength;
+                }
+            }
+            f = NetRingIncrementIndex(FR, f);
+        }
+
+        if (Ok && Total != 0) {
+            UINT64 A = N->TxPoolLa + (UINT64)(N->TxPost % RING_SIZE) * RX_BUF_SIZE + N->DmaOffset;
+            D->Addr = (ULONG)A;
+            if (N->Addr64) D->AddrHi = (ULONG)(A >> 32);
+            KeMemoryBarrier();
+            D->Ctrl = TXD_LEN(Total) | TXD_LAST |
+                      (((N->TxPost % RING_SIZE) == RING_SIZE - 1) ? TXD_WRAP : 0);
+            N->TxPost++;
+            InterlockedIncrement(&N->CntTxPosted);
+            Posted = TRUE;
+        } else {
+            InterlockedIncrement(&N->CntTxDone);     /* dropped (null path or unusable packet) */
+        }
+        FR->BeginIndex = f;                          /* packet is fully copied: return it to the OS now */
+    }
+    PR->BeginIndex = pi;
+
+    if (Posted) {
+        KeMemoryBarrier();
+        P(N, GEM_NCR, G(N, GEM_NCR) | NCR_TSTART);
+    }
 }
 
 static VOID EvtTxCancel(_In_ NETPACKETQUEUE Q)
@@ -766,10 +755,10 @@ static NTSTATUS EvtCreateRxQueue(_In_ NETADAPTER Adapter, _Inout_ NETRXQUEUE_INI
     C = GetQueueCtx(Q);
     C->Nic = GetAdapterCtx(Adapter)->Nic;
     C->Rings = NetRxQueueGetRingCollection(Q);
-    NET_EXTENSION_QUERY_INIT(&Ext, NET_FRAGMENT_EXTENSION_LOGICAL_ADDRESS_NAME,
-                             NET_FRAGMENT_EXTENSION_LOGICAL_ADDRESS_VERSION_1,
+    NET_EXTENSION_QUERY_INIT(&Ext, NET_FRAGMENT_EXTENSION_VIRTUAL_ADDRESS_NAME,
+                             NET_FRAGMENT_EXTENSION_VIRTUAL_ADDRESS_VERSION_1,
                              NetExtensionTypeFragment);
-    if (C->Nic->NoDma == 0 || C->Nic->NoDma == 4) NetRxQueueGetExtension(Q, &Ext, &C->LogAddr);
+    if (C->Nic->NoDma != 1) NetRxQueueGetExtension(Q, &Ext, &C->VaExt);
     C->Nic->RxQueue = Q;
     return STATUS_SUCCESS;
 }
@@ -794,10 +783,10 @@ static NTSTATUS EvtCreateTxQueue(_In_ NETADAPTER Adapter, _Inout_ NETTXQUEUE_INI
     C = GetQueueCtx(Q);
     C->Nic = GetAdapterCtx(Adapter)->Nic;
     C->Rings = NetTxQueueGetRingCollection(Q);
-    NET_EXTENSION_QUERY_INIT(&Ext, NET_FRAGMENT_EXTENSION_LOGICAL_ADDRESS_NAME,
-                             NET_FRAGMENT_EXTENSION_LOGICAL_ADDRESS_VERSION_1,
+    NET_EXTENSION_QUERY_INIT(&Ext, NET_FRAGMENT_EXTENSION_VIRTUAL_ADDRESS_NAME,
+                             NET_FRAGMENT_EXTENSION_VIRTUAL_ADDRESS_VERSION_1,
                              NetExtensionTypeFragment);
-    if (C->Nic->NoDma == 0 || C->Nic->NoDma == 3) NetTxQueueGetExtension(Q, &Ext, &C->LogAddr);
+    if (C->Nic->NoDma != 1) NetTxQueueGetExtension(Q, &Ext, &C->VaExt);
     C->Nic->TxQueue = Q;
     return STATUS_SUCCESS;
 }
@@ -898,33 +887,38 @@ static NTSTATUS CreateRings(PNIC_DEVICE N)
     N->TxRingLa = (UINT64)Pa.QuadPart;
     RtlZeroMemory(N->RxRing, Sz);
     RtlZeroMemory(N->TxRing, Sz);
+
+    /* Packet buffer pools owned by the driver (same coherent memory type as the rings). */
+    Sz = (SIZE_T)RING_SIZE * RX_BUF_SIZE;
+    S = WdfCommonBufferCreate(N->Dma, Sz, WDF_NO_OBJECT_ATTRIBUTES, &N->RxPoolBuf);
+    if (!NT_SUCCESS(S)) return S;
+    S = WdfCommonBufferCreate(N->Dma, Sz, WDF_NO_OBJECT_ATTRIBUTES, &N->TxPoolBuf);
+    if (!NT_SUCCESS(S)) return S;
+    N->RxPool = (PUCHAR)WdfCommonBufferGetAlignedVirtualAddress(N->RxPoolBuf);
+    Pa = WdfCommonBufferGetAlignedLogicalAddress(N->RxPoolBuf);
+    N->RxPoolLa = (UINT64)Pa.QuadPart;
+    N->TxPool = (PUCHAR)WdfCommonBufferGetAlignedVirtualAddress(N->TxPoolBuf);
+    Pa = WdfCommonBufferGetAlignedLogicalAddress(N->TxPoolBuf);
+    N->TxPoolLa = (UINT64)Pa.QuadPart;
+    RtlZeroMemory(N->RxPool, Sz);
+    RtlZeroMemory(N->TxPool, Sz);
     return STATUS_SUCCESS;
 }
 
 static NTSTATUS SetCapabilities(PNIC_DEVICE N)
 {
-    NET_ADAPTER_DMA_CAPABILITIES TxDma, RxDma;
     NET_ADAPTER_TX_CAPABILITIES Tx;
     NET_ADAPTER_RX_CAPABILITIES Rx;
     NET_ADAPTER_LINK_LAYER_CAPABILITIES LL;
     NET_ADAPTER_RECEIVE_FILTER_CAPABILITIES RF;
     NET_ADAPTER_LINK_LAYER_ADDRESS Addr;
 
-    if (N->NoDma == 0 || N->NoDma == 3) {
-        NET_ADAPTER_DMA_CAPABILITIES_INIT(&TxDma, N->Dma);
-        NET_ADAPTER_TX_CAPABILITIES_INIT_FOR_DMA(&Tx, &TxDma, 1);
-    } else {
-        NET_ADAPTER_TX_CAPABILITIES_INIT(&Tx, 1);
-    }
-    Tx.MaximumNumberOfFragments = 1;
-    Tx.FragmentRingNumberOfElementsHint = RING_SIZE;
+    /* Copy model: plain (non-DMA) capabilities; the driver copies to/from its own common buffers. */
+    NET_ADAPTER_TX_CAPABILITIES_INIT(&Tx, 1);
+    Tx.MaximumNumberOfFragments = 8;
+    Tx.FragmentRingNumberOfElementsHint = RING_SIZE * 2;
 
-    if (N->NoDma == 0 || N->NoDma == 4) {
-        NET_ADAPTER_DMA_CAPABILITIES_INIT(&RxDma, N->Dma);
-        NET_ADAPTER_RX_CAPABILITIES_INIT_SYSTEM_MANAGED_DMA(&Rx, &RxDma, RX_BUF_SIZE, 1);
-    } else {
-        NET_ADAPTER_RX_CAPABILITIES_INIT_SYSTEM_MANAGED(&Rx, RX_BUF_SIZE, 1);
-    }
+    NET_ADAPTER_RX_CAPABILITIES_INIT_SYSTEM_MANAGED(&Rx, RX_BUF_SIZE, 1);
     Rx.FragmentBufferAlignment = 64;
     Rx.FragmentRingNumberOfElementsHint = RING_SIZE;
 

@@ -6,7 +6,7 @@ Signature   = "$WINDOWS NT$"
 Class       = Net
 ClassGuid   = {4d36e972-e325-11ce-bfc1-08002be10318}
 Provider    = %ManufacturerName%
-DriverVer   = 11/03/2026,1.0.0.1
+DriverVer   = 11/04/2026,1.0.0.2
 CatalogFile = RpiEthNic.cat
 PnpLockdown = 1
 
