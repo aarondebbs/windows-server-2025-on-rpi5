@@ -534,12 +534,7 @@ static VOID EvtRxAdvance(_In_ NETPACKETQUEUE Q)
     UINT32 fi = FR->BeginIndex;
     UINT32 fEnd = FR->NextIndex;          /* fragments already posted to hw */
 
-    if (!(N->DataPath & 2)) {
-        /* Null receive path: take ownership of every buffer Windows offers (as if posted to hardware that never
-         * delivers). Leaving them unclaimed makes the framework call Advance in a tight DPC loop. */
-        FR->NextIndex = FR->EndIndex;
-        return;
-    }
+    if (!(N->DataPath & 2)) return;       /* null receive path: nothing to do, like the sample when no frame arrived */
 
     /* Indicate received frames. */
     while (fi != fEnd) {
@@ -657,12 +652,17 @@ static VOID EvtTxAdvance(_In_ NETPACKETQUEUE Q)
     BOOLEAN Posted = FALSE;
 
     if (!(N->DataPath & 1)) {
-        /* Transmit disabled: complete and drop everything immediately so the stack never waits on us. */
-        InterlockedAdd(&N->CntTxDone, (LONG)((PR->EndIndex - PR->BeginIndex) & PR->ElementIndexMask));
-        PR->NextIndex = PR->EndIndex;
+        /* Transmit disabled: complete and drop every packet exactly like Microsoft's netvadapter sample
+         * (iterators only; NextIndex is never touched). */
+        UINT32 pi;
+        for (pi = PR->BeginIndex; pi != PR->EndIndex; pi = NetRingIncrementIndex(PR, pi)) {
+            NET_PACKET *Pk = NetRingGetPacketAtIndex(PR, pi);
+            UINT32 f = Pk->FragmentIndex, k;
+            for (k = 0; k < Pk->FragmentCount; k++) f = NetRingIncrementIndex(FR, f);
+            FR->BeginIndex = f;
+            InterlockedIncrement(&N->CntTxDone);
+        }
         PR->BeginIndex = PR->EndIndex;
-        FR->NextIndex = FR->EndIndex;
-        FR->BeginIndex = FR->EndIndex;
         return;
     }
 
