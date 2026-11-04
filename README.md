@@ -93,7 +93,8 @@ Running **Windows Server (ARM64 Insider preview)** natively on a **Raspberry Pi 
 **Graphics** (see [the plan](docs/graphics-driver-plan.md))
 - [x] Map the display and GPU hardware from the Linux drivers and the Pi 5 firmware
 - [ ] 🚧 Stage 0: probe driver and firmware ACPI patch (drafted, not run yet)
-- [ ] 📅 Stage 1: firmware-assisted display-only driver (resolution control)
+- [ ] 📅 Stage 1a: stock Microsoft display-only sample on our device (instructions written, not tried)
+- [ ] 📅 Stage 1b: full-screen resolution control through the firmware
 - [ ] 📅 Stage 2: native display pipeline (HVS, HDMI)
 - [ ] 📅 Stage 3: V3D 3D support (Vulkan)
 
@@ -108,7 +109,7 @@ The Pi 5 has a VideoCore VII GPU (V3D 7.1) and a separate display pipeline (HVS,
 | Stage | Goal | Status |
 |---|---|:---:|
 | 0. Probe | [`RpiGpuProbe`](driver/RpiGpuProbe) + [`gpu-acpi.patch`](firmware/gpu-acpi.patch): can Windows reach the firmware mailbox, the PM block and V3D? Reads framebuffer, EDID and clock state. | 🚧 |
-| 1. Firmware-assisted display driver | A WDDM display-only driver that takes over the screen and changes resolution through the VideoCore firmware (the way the Pi 5 UEFI driver does). Not faster than Basic Display by itself; gains would come from how it copies frames to the screen | 📅 |
+| 1. Display driver with resolution control | **1a:** Microsoft's display-only sample installed on our device (lower resolutions, centred; [`RpiDisplay`](driver/RpiDisplay)). **1b:** full-screen mode changes through the VideoCore firmware. Not faster than Basic Display at the same resolution; the gain comes from running at a lower one | 📅 |
 | 2. Native display pipeline | Mode setting without the firmware: HVS, pixel valves, HDMI, second display | 📅 |
 | 3. 3D (V3D) | Kernel job submission and a Vulkan driver (Mesa `v3dv` port). Desktop-wide acceleration would need a separate, much larger WDDM render driver | 📅 |
 
@@ -143,6 +144,7 @@ Test signing is the only switch that lets a self-signed kernel driver load, and 
 |---|---|
 | [`driver/RpiEth/`](driver/RpiEth) | `RpiEthNic`, the NetAdapterCx Ethernet driver, with its [design notes](driver/RpiEth/DESIGN.md) |
 | [`driver/RpiEthProbe/`](driver/RpiEthProbe) | Early probe driver that read the GEM and PHY IDs (superseded by `RpiEthNic`) |
+| [`driver/RpiDisplay/`](driver/RpiDisplay) | Graphics stage 1a: how to build and install Microsoft's display-only sample on the Pi (instructions only) |
 | [`driver/RpiGpuProbe/`](driver/RpiGpuProbe) | Graphics stage 0: probe driver for the VideoCore mailbox, PM block and V3D (not yet compiled or run) |
 | [`firmware/rp1-eth-acpi.patch`](firmware/rp1-eth-acpi.patch) | edk2-platforms patch that exposes the RP1 MAC via ACPI |
 | [`firmware/gpu-acpi.patch`](firmware/gpu-acpi.patch) | edk2-platforms patch that exposes the mailbox, PM block and V3D via ACPI (for the GPU probe) |

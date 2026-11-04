@@ -67,11 +67,10 @@ The stated goal is a better desktop experience on a server (no games). That chan
 - **Real acceleration of the desktop** needs a full WDDM render driver plus a Direct3D
   user-mode driver for the V3D GPU. A Vulkan driver (Stage 3) does not accelerate the Windows
   desktop. That full driver is a research-level project, not a next step.
-- **Where a driver can help without a GPU:** if the slow part is *getting frames to the
-  screen* (framebuffer mapped uncached, byte-wise copies, whole-screen copies instead of changed
-  rectangles), a custom display-only driver with a write-combined mapping and efficient
-  partial-update copies could give a real gain. This is plausible but unproven; it needs
-  measurement first.
+- **Presenting frames is probably not the bottleneck.** Microsoft's display-only sample already
+  maps the framebuffer write-combined (falling back to uncached) and handles changed rectangles,
+  so a custom driver is not expected to be much faster at copying frames out. The real lever is
+  **how many pixels the CPU has to draw**, which is the resolution.
 - **Things that need no driver and should be checked first:** the CPU may be running slower than
   it should (Windows reports about 0.25 GHz; unconfirmed whether that is real), the power plan,
   Windows visual effects, and the console resolution (a 4K framebuffer is about 33 MB per frame).
@@ -93,26 +92,40 @@ read-only to powering up V3D and reading its ID registers. Nothing is drawn.
 **Done when:** the mailbox answers from Windows (firmware revision comes back), and we have
 the framebuffer geometry, EDID and V3D clock/reset state from the real board.
 
-### Stage 1: firmware-assisted display driver
+### Stage 1: display driver with resolution control
 
-A WDDM *display-only* miniport (the pattern of Microsoft's KMDOD sample) that replaces
-Microsoft Basic Display Adapter:
+Based on Microsoft's open-source **KMDOD** sample (`microsoft/Windows-driver-samples`,
+`video/KMDOD`, about 3,600 lines of C++, licence MS-PL). It is a WDDM *display-only* miniport, the
+same kind of driver as Microsoft Basic Display Adapter, and it already builds for ARM64 and lists
+`ACPI\CLS_0003&SUBCLS_0000` display devices in its INF.
 
-- takes over the screen UEFI already set up,
-- reads the monitor's EDID through the mailbox and offers real modes,
-- changes resolution by asking the firmware for a new framebuffer,
-- Windows still composites in software; the driver just presents the frames.
+**1a. Stock sample on our ACPI device (no new code).** Build the sample unchanged, add
+`ACPI\RPIG0001` to its `[Standard.NTarm64]` section and install it. It takes over the
+framebuffer UEFI set up (`DxgkCbAcquirePostDisplayOwnership`) and offers every standard mode up to
+the boot resolution (800x600 up to 1920x1200). A smaller mode is drawn by Windows at the smaller
+size and shown inside the boot-resolution framebuffer, so it **appears centred with black borders**,
+not filling the screen. This answers two questions cheaply: does Windows bind a display-only
+driver to our device and hand it the screen, and **does a lower resolution actually make the
+desktop smoother?**
 
-What you get: proper resolution choice and a real display adapter in Device Manager, with
-no HVS/HDMI programming. What you don't get: acceleration, a second display, or independence
-from the firmware. **It is not faster than Basic Display Adapter by itself**; any speed gain
-would come from how the driver maps and copies into the framebuffer (see 3b).
+**1b. Full-screen modes through the firmware.** Copy the sample into the repo (MS-PL notices kept)
+and change it so a mode change really changes the monitor's mode: read the monitor's EDID through the
+mailbox to list its real modes, and on a mode commit ask the firmware for a new framebuffer
+(`SET_FB_PGEOM`/`SET_FB_VGEOM`/`SET_FB_DEPTH`/`ALLOC_FB`/`GET_FB_LINELENGTH`, as the UEFI driver does),
+then remap it. The hooks are `StartDevice`, `AddSingleSourceMode`/`AddSingleMonitorMode` (mode
+lists) and `SetSourceModeAndPath` (where the framebuffer is mapped).
 
-**Open questions the probe answers:** does the mailbox work from Windows; can the firmware
-still allocate a new framebuffer after the OS has taken over; is the new framebuffer memory
-one Windows will let a driver map.
+What you get: resolution choice that fills the screen, and a real display adapter in Device
+Manager, with no HVS/HDMI programming. What you don't get: acceleration, a second display, or
+independence from the firmware. **It is not faster than Basic Display Adapter at a given
+resolution**; the speed-up comes from running at a lower one (see 3b).
 
-**Done when:** a mode change from Windows Display Settings changes what the monitor shows.
+**Open questions the probe and 1a answer:** does the mailbox work from Windows; can the firmware
+still allocate a new framebuffer after the OS has taken over; is the new framebuffer memory one
+Windows will let a driver map; does Windows hand our ACPI device the POST display.
+
+**Done when:** picking a resolution in Windows Display Settings changes what the monitor shows,
+filling the screen.
 
 ### Stage 2: native display pipeline
 
@@ -145,7 +158,7 @@ project.
   several hardware rounds; here each round costs more (a firmware rebuild is needed for the ACPI patch).
 - **The firmware ACPI patch is unverified** (no ASL compiler available while writing it; it
   applies cleanly to `rpi5-dev` and copies the existing `URT0` resource pattern).
-- **Stage 1 depends on firmware behaviour after boot** that we haven't observed yet.
+- **Stage 1b depends on firmware behaviour after boot** that we haven't observed yet; 1a does not.
 - **Effort is very uneven:** Stage 1 is comparable to the Ethernet effort; Stage 2 is several
   times that; Stage 3 is a long project.
 - **Licensing:** the Linux `vc4`/`v3d`/Mesa code is GPL-2.0 / MIT. We re-implement behaviour from
@@ -154,9 +167,10 @@ project.
 
 ## 6. Next step
 
-1. Rebuild the firmware with `firmware/gpu-acpi.patch` (keep the Ethernet patch).
+1. Rebuild the firmware with `firmware/gpu-acpi.patch` (keep the Ethernet patch). One rebuild serves both the probe and Stage 1a.
 2. Build and install `driver/RpiGpuProbe`, run level 0, send the registry values.
-3. Based on that, start Stage 1 (or fix the mailbox path first).
+3. Try Stage 1a ([`driver/RpiDisplay`](../driver/RpiDisplay)): the stock Microsoft sample on our device.
+4. Based on those, write Stage 1b (or fix the mailbox path first).
 
 ## Sources (Linux, `rpi-6.12.y`)
 
