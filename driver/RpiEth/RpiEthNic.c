@@ -162,6 +162,7 @@ typedef struct _NIC_DEVICE {
     volatile BOOLEAN Polling;
     USHORT DbgBmsr, DbgLpa, Dbg1000St, DbgAux19, DbgBmcr;
     ULONG  PollCount;
+    ULONG  PollSec;     /* registry PollSec: link poll interval in seconds, 0 = no polling (link forced up at 1000/full) */
     volatile LONG CntTxStart, CntRxStart, CntTxPosted, CntTxDone, CntRxDone;  /* data-path counters, published by the link timer */
     volatile LONG Crumb;   /* stop-path breadcrumbs: 1 RxStop 2 RxCancel 4 TxStop 8 TxCancel 0x10 D0Exit 0x20 timer stopped 0x40 D0Exit done 0x80 ReleaseHw */
     BOOLEAN LinkUp;
@@ -387,7 +388,7 @@ static VOID EvtLinkTimer(_In_ WDFTIMER Timer)
     ULONG Mbps;
 
     if (!N->Polling) return;
-    if (!N->PhyUp) { WdfTimerStart(Timer, WDF_REL_TIMEOUT_IN_SEC(1)); return; }
+    if (!N->PhyUp) { WdfTimerStart(Timer, WDF_REL_TIMEOUT_IN_SEC(N->PollSec ? N->PollSec : 1)); return; }
     PhyReadLink(N, &Up, &Mbps, &Full);
     N->PollCount++;
     TRACEVAL(L"PollCount", N->PollCount);
@@ -425,7 +426,7 @@ static VOID EvtLinkTimer(_In_ WDFTIMER Timer)
         PublishLink(N, Up, Mbps, Full);
     }
     TraceFlush();                                 /* one flush per second so the values survive a hang */
-    if (N->Polling) WdfTimerStart(Timer, WDF_REL_TIMEOUT_IN_SEC(1));
+    if (N->Polling) WdfTimerStart(Timer, WDF_REL_TIMEOUT_IN_SEC(N->PollSec ? N->PollSec : 1));
 }
 
 /* ------------------------------------------------------------------ */
@@ -797,6 +798,7 @@ static VOID LoadSettings(PNIC_DEVICE N)
     N->DmaOffset = 0;
     N->OnlyGigabit = 1;
     N->DataPath = 0;
+    N->PollSec = 1;
 
     if (!NT_SUCCESS(WdfDeviceOpenRegistryKey(N->Device, PLUGPLAY_REGKEY_DEVICE,
                                              KEY_ALL_ACCESS, WDF_NO_OBJECT_ATTRIBUTES, &Key))) {
@@ -810,6 +812,8 @@ static VOID LoadSettings(PNIC_DEVICE N)
         }
         if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NOnly, &V))) N->OnlyGigabit = V;
         {
+            DECLARE_CONST_UNICODE_STRING(NPoll, L"PollSec");
+            if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NPoll, &V))) N->PollSec = V;
             DECLARE_CONST_UNICODE_STRING(NData, L"DataPath");
             if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NData, &V))) N->DataPath = V;
         }
@@ -997,8 +1001,18 @@ static NTSTATUS EvtD0Entry(_In_ WDFDEVICE Device, _In_ WDF_POWER_DEVICE_STATE Pr
     }
     N->LinkUp = FALSE;
     PublishLink(N, FALSE, 0, FALSE);
-    N->Polling = TRUE;
-    WdfTimerStart(N->LinkTimer, WDF_REL_TIMEOUT_IN_SEC(1));
+    if (N->PollSec == 0) {
+        /* no polling: assume the cable is plugged in at 1 Gbit/s full duplex */
+        N->Polling = FALSE;
+        SetMacSpeed(N, 1000, TRUE);
+        N->LinkUp = TRUE; N->LinkMbps = 1000;
+        PublishLink(N, TRUE, 1000, TRUE);
+        TRACEVAL(L"PollMode", 0);
+        TraceFlush();
+    } else {
+        N->Polling = TRUE;
+        WdfTimerStart(N->LinkTimer, WDF_REL_TIMEOUT_IN_SEC(N->PollSec));
+    }
     Trace(22, STATUS_SUCCESS);         /* D0 entry finished */
     return STATUS_SUCCESS;
 }
