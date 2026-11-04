@@ -206,6 +206,14 @@ static VOID TraceVal(PCUNICODE_STRING Name, ULONG Value)
     if (NT_SUCCESS(WdfDriverOpenParametersRegistryKey(WdfGetDriver(), KEY_SET_VALUE,
                                                       WDF_NO_OBJECT_ATTRIBUTES, &Key))) {
         (VOID)WdfRegistryAssignULong(Key, Name, Value);
+        WdfRegistryClose(Key);
+    }
+}
+static VOID TraceFlush(VOID)
+{
+    WDFKEY Key;
+    if (NT_SUCCESS(WdfDriverOpenParametersRegistryKey(WdfGetDriver(), KEY_SET_VALUE,
+                                                      WDF_NO_OBJECT_ATTRIBUTES, &Key))) {
         (VOID)ZwFlushKey(WdfRegistryWdmGetHandle(Key));
         WdfRegistryClose(Key);
     }
@@ -416,6 +424,7 @@ static VOID EvtLinkTimer(_In_ WDFTIMER Timer)
         TRACEVAL(L"LinkMbps", Mbps);
         PublishLink(N, Up, Mbps, Full);
     }
+    TraceFlush();                                 /* one flush per second so the values survive a hang */
     if (N->Polling) WdfTimerStart(Timer, WDF_REL_TIMEOUT_IN_SEC(1));
 }
 
