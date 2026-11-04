@@ -172,6 +172,9 @@ typedef struct _NIC_DEVICE {
     volatile LONG CntRxZero, CntRxFF, CntRxOther;   /* RX frame content probe: first 6 bytes all 0 / all FF / other */
     ULONG  RxSampleW[12], RxSampleCtrl, RxSampleAddr, RxSampleAddrHi; volatile LONG RxSampleSet;
     volatile LONG ProbeSet; ULONG ProbeTbqp[8], ProbeTsr[8], ProbeD0[8], ProbeD1[8];   /* TX start dynamics probe */
+    ULONG  TxLate;      /* registry TxLate: 1 = enable TE + load TBQP only when the first frame is ready */
+    BOOLEAN TeOn;
+    ULONG  QTbqp[4], QTsr[4];   /* idle-TSTART probe at TX start */
     ULONG  PollSec;     /* registry PollSec: link poll interval in seconds, 0 = no polling (link forced up at 1000/full) */
     volatile LONG CntTxStart, CntRxStart, CntTxPosted, CntTxDone, CntRxDone;  /* data-path counters, published by the link timer */
     volatile LONG Crumb;   /* stop-path breadcrumbs: 1 RxStop 2 RxCancel 4 TxStop 8 TxCancel 0x10 D0Exit 0x20 timer stopped 0x40 D0Exit done 0x80 ReleaseHw */
@@ -444,6 +447,17 @@ static VOID EvtLinkTimer(_In_ WDFTIMER Timer)
             }
         }
     }
+    {
+        ULONG i;
+        for (i = 0; i < 4; i++) {
+            WCHAR nm[24];
+            UNICODE_STRING us;
+            if (!N->QTsr[i] && !N->QTbqp[i]) continue;
+            RtlStringCchPrintfW(nm, 24, L"Q%u_Tbqp", i); RtlInitUnicodeString(&us, nm); TraceVal(&us, N->QTbqp[i]);
+            RtlStringCchPrintfW(nm, 24, L"Q%u_Tsr", i);  RtlInitUnicodeString(&us, nm); TraceVal(&us, N->QTsr[i]);
+        }
+    }
+    TRACEVAL(L"TxLate", N->TxLate);
     if (N->ProbeSet) {
         ULONG i;
         for (i = 0; i < 8; i++) {
@@ -714,16 +728,29 @@ static VOID EvtTxStart(_In_ NETPACKETQUEUE Q)
     TRACEVAL(L"TxS_TsrBefore", G(N, GEM_TSR));
     TRACEVAL(L"TxS_TbqpBefore", G(N, GEM_TBQP));
     TRACEVAL(L"TxS_TbqphBefore", G(N, GEM_TBQPH));
+    N->TeOn = FALSE;
+    InterlockedIncrement(&N->CntTxStart);
+    if (N->TxLate) return;                           /* TE + TBQP are set when the first frame is ready */
     P(N, GEM_TBQP, (ULONG)A);
     if (N->Addr64) P(N, GEM_TBQPH, (ULONG)(A >> 32));
     TRACEVAL(L"TxS_WantLo", (ULONG)A);
     TRACEVAL(L"TxS_WantHi", (ULONG)(A >> 32));
     TRACEVAL(L"TxS_TbqpAfter", G(N, GEM_TBQP));
     TRACEVAL(L"TxS_TbqphAfter", G(N, GEM_TBQPH));
-    InterlockedIncrement(&N->CntTxStart);
     P(N, GEM_NCR, G(N, GEM_NCR) | NCR_TE);
+    N->TeOn = TRUE;
     TRACEVAL(L"TxS_TbqpTe", G(N, GEM_TBQP));
     TRACEVAL(L"TxS_TsrTe", G(N, GEM_TSR));
+    {
+        /* Idle probe: every descriptor is software-owned, so TSTART must make the engine halt at once. */
+        ULONG j;
+        P(N, GEM_NCR, G(N, GEM_NCR) | NCR_TSTART);
+        for (j = 0; j < 4; j++) {
+            KeStallExecutionProcessor(j == 0 ? 0 : (j == 1 ? 10 : (j == 2 ? 50 : 40)));
+            N->QTbqp[j] = G(N, GEM_TBQP);
+            N->QTsr[j] = G(N, GEM_TSR);
+        }
+    }
 }
 
 static VOID EvtTxStop(_In_ NETPACKETQUEUE Q)
@@ -732,6 +759,7 @@ static VOID EvtTxStop(_In_ NETPACKETQUEUE Q)
     PNIC_DEVICE N = GetQueueCtx(Q)->Nic;
     InterlockedOr(&N->Crumb, 4);
     P(N, GEM_NCR, G(N, GEM_NCR) & ~NCR_TE);
+    N->TeOn = FALSE;
 }
 
 static VOID EvtTxAdvance(_In_ NETPACKETQUEUE Q)
@@ -798,7 +826,14 @@ static VOID EvtTxAdvance(_In_ NETPACKETQUEUE Q)
     }
     PR->BeginIndex = pi;
 
-    if (Posted || (N->TxClean != N->TxPost && Live)) {
+    if (Posted && !N->TeOn) {
+        UINT64 A = N->TxRingLa + N->DmaOffset;
+        P(N, GEM_TBQP, (ULONG)A);
+        if (N->Addr64) P(N, GEM_TBQPH, (ULONG)(A >> 32));
+        P(N, GEM_NCR, G(N, GEM_NCR) | NCR_TE);
+        N->TeOn = TRUE;
+    }
+    if (Posted || (N->TxClean != N->TxPost && Live && N->TeOn)) {
         KeMemoryBarrier();
         P(N, GEM_NCR, G(N, GEM_NCR) | NCR_TSTART);   /* re-kick: Linux sees lost TSTART writes on this MAC */
     }
@@ -943,6 +978,8 @@ static VOID LoadSettings(PNIC_DEVICE N)
             if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NNoDma, &V))) N->NoDma = V;
             DECLARE_CONST_UNICODE_STRING(NDma32, L"Dma32");
             if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NDma32, &V))) N->Dma32 = V;
+            DECLARE_CONST_UNICODE_STRING(NLate, L"TxLate");
+            if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NLate, &V))) N->TxLate = V;
             DECLARE_CONST_UNICODE_STRING(NBis, L"Bisect");
             if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NBis, &V))) N->Bisect = V;
             DECLARE_CONST_UNICODE_STRING(NPoll, L"PollSec");
