@@ -645,10 +645,21 @@ static VOID EvtTxStart(_In_ NETPACKETQUEUE Q)
         D->Ctrl = TXD_USED | (i == RING_SIZE - 1 ? TXD_WRAP : 0);
     }
     N->TxPost = N->TxClean = 0;
+    P(N, GEM_TSR, 0xFFFFFFFF);                       /* clear stale TX status (write-1-to-clear) */
+    TRACEVAL(L"TxS_NcrBefore", G(N, GEM_NCR));
+    TRACEVAL(L"TxS_TsrBefore", G(N, GEM_TSR));
+    TRACEVAL(L"TxS_TbqpBefore", G(N, GEM_TBQP));
+    TRACEVAL(L"TxS_TbqphBefore", G(N, GEM_TBQPH));
     P(N, GEM_TBQP, (ULONG)A);
     if (N->Addr64) P(N, GEM_TBQPH, (ULONG)(A >> 32));
+    TRACEVAL(L"TxS_WantLo", (ULONG)A);
+    TRACEVAL(L"TxS_WantHi", (ULONG)(A >> 32));
+    TRACEVAL(L"TxS_TbqpAfter", G(N, GEM_TBQP));
+    TRACEVAL(L"TxS_TbqphAfter", G(N, GEM_TBQPH));
     InterlockedIncrement(&N->CntTxStart);
     P(N, GEM_NCR, G(N, GEM_NCR) | NCR_TE);
+    TRACEVAL(L"TxS_TbqpTe", G(N, GEM_TBQP));
+    TRACEVAL(L"TxS_TsrTe", G(N, GEM_TSR));
 }
 
 static VOID EvtTxStop(_In_ NETPACKETQUEUE Q)
