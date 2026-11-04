@@ -172,6 +172,8 @@ typedef struct _NIC_DEVICE {
     volatile LONG CntRxZero, CntRxFF, CntRxOther;   /* RX frame content probe: first 6 bytes all 0 / all FF / other */
     ULONG  RxSampleW[12], RxSampleCtrl, RxSampleAddr, RxSampleAddrHi; volatile LONG RxSampleSet;
     volatile LONG ProbeSet; ULONG ProbeTbqp[8], ProbeTsr[8], ProbeD0[8], ProbeD1[8];   /* TX start dynamics probe */
+    ULONG  TsuClk;      /* registry TsuClk: 1 = enable clk_eth_tsu (ctrl 0x134 bit 11), 2 = also select aux source 0 (xosc, 50 MHz) */
+    ULONG  TsuBefore[4], TsuAfter[4];
     ULONG  TxScan;      /* registry TxScan: 1 = at TX start, probe which (address offset, descriptor size) makes the TX engine stop on an all-ones ring */
     ULONG  ScN, ScHi[16], ScA64[16], ScB[16], ScS1[16], ScT1[16], ScS2[16], ScT2[16];
     ULONG  Force32;     /* registry Force32: 1 = use 32-bit (8-byte) descriptors even though the GEM supports 64-bit */
@@ -458,6 +460,50 @@ static VOID EvtLinkTimer(_In_ WDFTIMER Timer)
             if (!N->QTsr[i] && !N->QTbqp[i]) continue;
             RtlStringCchPrintfW(nm, 24, L"Q%u_Tbqp", i); RtlInitUnicodeString(&us, nm); TraceVal(&us, N->QTbqp[i]);
             RtlStringCchPrintfW(nm, 24, L"Q%u_Tsr", i);  RtlInitUnicodeString(&us, nm); TraceVal(&us, N->QTsr[i]);
+        }
+    }
+    TRACEVAL(L"TsuClk", N->TsuClk);
+    TRACEVAL(L"ClkLen", (ULONG)N->ClkLen);
+    TRACEVAL(L"CfgLen", (ULONG)N->CfgLen);
+    TRACEVAL(L"TsuB_134", N->TsuBefore[0]); TRACEVAL(L"TsuB_138", N->TsuBefore[1]);
+    TRACEVAL(L"TsuB_13C", N->TsuBefore[2]); TRACEVAL(L"TsuB_140", N->TsuBefore[3]);
+    TRACEVAL(L"TsuA_134", N->TsuAfter[0]);  TRACEVAL(L"TsuA_138", N->TsuAfter[1]);
+    TRACEVAL(L"TsuA_13C", N->TsuAfter[2]);  TRACEVAL(L"TsuA_140", N->TsuAfter[3]);
+    if (N->Clk && N->ClkLen > 0x74) {
+        TRACEVAL(L"ClkEth70", Rd(N->Clk, 0x70));     /* clk_eth sel register per the Linux clk-rp1 table */
+    }
+    if (N->Cfg && N->CfgLen >= 0x40) {
+        ULONG k;
+        for (k = 0; k < 16; k++) {
+            WCHAR nm[16]; UNICODE_STRING us; ULONG v = Rd(N->Cfg, k * 4);
+            if (!v) continue;
+            RtlStringCchPrintfW(nm, 16, L"Cfg%02X", k * 4); RtlInitUnicodeString(&us, nm); TraceVal(&us, v);
+        }
+    }
+    if (N->Gem) {
+        /* every non-zero GEM register in the ranges we do not otherwise log */
+        ULONG off;
+        for (off = 0x40; off < 0x100; off += 4) {
+            ULONG v;
+            WCHAR nm[16]; UNICODE_STRING us;
+            if (off == 0x98 || off == 0x9C || off == 0xFC) continue;
+            v = G(N, off);
+            if (!v) continue;
+            RtlStringCchPrintfW(nm, 16, L"GR%03X", off); RtlInitUnicodeString(&us, nm); TraceVal(&us, v);
+        }
+        for (off = 0x280; off < 0x2A0; off += 4) {
+            ULONG v = G(N, off);
+            WCHAR nm[16]; UNICODE_STRING us;
+            if (!v || off == 0x280 || off == 0x294) continue;
+            RtlStringCchPrintfW(nm, 16, L"GR%03X", off); RtlInitUnicodeString(&us, nm); TraceVal(&us, v);
+        }
+        for (off = 0x400; off < 0x4E0; off += 4) {
+            ULONG v;
+            WCHAR nm[16]; UNICODE_STRING us;
+            if (off == 0x4C8 || off == 0x4D4) continue;
+            v = G(N, off);
+            if (!v) continue;
+            RtlStringCchPrintfW(nm, 16, L"GR%03X", off); RtlInitUnicodeString(&us, nm); TraceVal(&us, v);
         }
     }
     TRACEVAL(L"TxScan", N->TxScan);
@@ -1036,6 +1082,8 @@ static VOID LoadSettings(PNIC_DEVICE N)
             if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NNoDma, &V))) N->NoDma = V;
             DECLARE_CONST_UNICODE_STRING(NDma32, L"Dma32");
             if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NDma32, &V))) N->Dma32 = V;
+            DECLARE_CONST_UNICODE_STRING(NTsu, L"TsuClk");
+            if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NTsu, &V))) N->TsuClk = V;
             DECLARE_CONST_UNICODE_STRING(NScan, L"TxScan");
             if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NScan, &V))) N->TxScan = V;
             DECLARE_CONST_UNICODE_STRING(NF32, L"Force32");
@@ -1184,6 +1232,23 @@ static NTSTATUS EvtPrepareHardware(_In_ WDFDEVICE Device, _In_ WDFCMRESLIST Raw,
     Trace(12, STATUS_SUCCESS);         /* resources mapped */
 
     LoadSettings(N);
+
+    /* clk_eth_tsu (the GEM timestamp-unit clock): ctrl 0x134, div_int 0x138, sel 0x140. Linux enables it in the
+     * MAC's clock setup; our firmware never programs it. */
+    if (N->Clk && N->ClkLen > 0x144) {
+        N->TsuBefore[0] = Rd(N->Clk, 0x134); N->TsuBefore[1] = Rd(N->Clk, 0x138);
+        N->TsuBefore[2] = Rd(N->Clk, 0x13C); N->TsuBefore[3] = Rd(N->Clk, 0x140);
+        if (N->TsuClk) {
+            ULONG Ctl = Rd(N->Clk, 0x134);
+            if (N->TsuClk >= 2) Ctl &= ~(0x1FUL << 5);           /* AUXSRC = 0 */
+            Ctl |= (1UL << 11);                                   /* ENABLE */
+            if (Rd(N->Clk, 0x138) == 0) Wr(N->Clk, 0x138, 1);     /* DIV_INT >= 1 */
+            Wr(N->Clk, 0x134, Ctl);
+            MsDelay(2);
+        }
+        N->TsuAfter[0] = Rd(N->Clk, 0x134); N->TsuAfter[1] = Rd(N->Clk, 0x138);
+        N->TsuAfter[2] = Rd(N->Clk, 0x13C); N->TsuAfter[3] = Rd(N->Clk, 0x140);
+    }
 
     WdfDeviceSetAlignmentRequirement(Device, FILE_64_BYTE_ALIGNMENT);
     /* Descriptor format: 64-bit only if the GEM says so (DCFG6.DAW64). Wrong
