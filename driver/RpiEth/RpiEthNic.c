@@ -179,6 +179,12 @@ typedef struct _QUEUE_CTX {
 } QUEUE_CTX;
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(QUEUE_CTX, GetQueueCtx)
 
+/* hang diagnostics: last callback entered + per-callback entry counts, published by the link timer */
+volatile LONG g_LastCb;
+volatile LONG g_CbCnt[16];
+#define CB_ENTER(id) do { g_LastCb = (id); InterlockedIncrement(&g_CbCnt[(id)]); } while (0)
+#define CB_LEAVE() do { g_LastCb = 0; } while (0)
+
 /* Progress trace: writes LastStep/LastStatus under
  * HKLM\SYSTEM\CurrentControlSet\Services\RpiEthNic\Parameters so a failed
  * start can be diagnosed from regedit. Step numbers: see Trace() call sites. */
@@ -200,6 +206,7 @@ static VOID TraceVal(PCUNICODE_STRING Name, ULONG Value)
     if (NT_SUCCESS(WdfDriverOpenParametersRegistryKey(WdfGetDriver(), KEY_SET_VALUE,
                                                       WDF_NO_OBJECT_ATTRIBUTES, &Key))) {
         (VOID)WdfRegistryAssignULong(Key, Name, Value);
+        (VOID)ZwFlushKey(WdfRegistryGetHandle(Key));
         WdfRegistryClose(Key);
     }
 }
@@ -376,6 +383,15 @@ static VOID EvtLinkTimer(_In_ WDFTIMER Timer)
     PhyReadLink(N, &Up, &Mbps, &Full);
     N->PollCount++;
     TRACEVAL(L"PollCount", N->PollCount);
+    TRACEVAL(L"LastCb", g_LastCb);
+    TRACEVAL(L"CbRxStart", g_CbCnt[1]);    TRACEVAL(L"CbRxStop", g_CbCnt[2]);
+    TRACEVAL(L"CbRxAdvance", g_CbCnt[3]);  TRACEVAL(L"CbRxCancel", g_CbCnt[4]);
+    TRACEVAL(L"CbRxNotify", g_CbCnt[5]);   TRACEVAL(L"CbTxStart", g_CbCnt[6]);
+    TRACEVAL(L"CbTxStop", g_CbCnt[7]);     TRACEVAL(L"CbTxAdvance", g_CbCnt[8]);
+    TRACEVAL(L"CbTxCancel", g_CbCnt[9]);   TRACEVAL(L"CbTxNotify", g_CbCnt[10]);
+    TRACEVAL(L"CbFilter", g_CbCnt[11]);    TRACEVAL(L"CbIsr", g_CbCnt[12]);
+    TRACEVAL(L"CbDpc", g_CbCnt[13]);       TRACEVAL(L"CbCreateRx", g_CbCnt[14]);
+    TRACEVAL(L"CbCreateTx", g_CbCnt[15]);
     TRACEVAL(L"StopCrumb", N->Crumb);
     TRACEVAL(L"CntTxStart", N->CntTxStart);
     TRACEVAL(L"CntRxStart", N->CntRxStart);
@@ -408,6 +424,7 @@ static VOID EvtLinkTimer(_In_ WDFTIMER Timer)
 /* ------------------------------------------------------------------ */
 static BOOLEAN EvtIsr(_In_ WDFINTERRUPT Interrupt, _In_ ULONG MessageID)
 {
+    CB_ENTER(12);
     PNIC_DEVICE N = GetNic(WdfInterruptGetDevice(Interrupt));
     ULONG S;
     UNREFERENCED_PARAMETER(MessageID);
@@ -424,6 +441,7 @@ static BOOLEAN EvtIsr(_In_ WDFINTERRUPT Interrupt, _In_ ULONG MessageID)
 
 static VOID EvtDpc(_In_ WDFINTERRUPT Interrupt, _In_ WDFOBJECT Obj)
 {
+    CB_ENTER(13);
     PNIC_DEVICE N = GetNic(WdfInterruptGetDevice(Interrupt));
     ULONG S = (ULONG)InterlockedExchange((volatile LONG *)&N->PendingStatus, 0);
     UNREFERENCED_PARAMETER(Obj);
@@ -460,6 +478,7 @@ static VOID SetDescAddr(PNIC_DEVICE N, GEM_DESC *D, UINT64 La, ULONG Flags)
 /* ------------------------------------------------------------------ */
 static VOID EvtRxStart(_In_ NETPACKETQUEUE Q)
 {
+    CB_ENTER(1);
     PNIC_DEVICE N = GetQueueCtx(Q)->Nic;
     ULONG i;
     UINT64 A = N->RxRingLa + N->DmaOffset;
@@ -479,6 +498,7 @@ static VOID EvtRxStart(_In_ NETPACKETQUEUE Q)
 
 static VOID EvtRxStop(_In_ NETPACKETQUEUE Q)
 {
+    CB_ENTER(2);
     PNIC_DEVICE N = GetQueueCtx(Q)->Nic;
     InterlockedOr(&N->Crumb, 1);
     P(N, GEM_NCR, G(N, GEM_NCR) & ~NCR_RE);
@@ -486,6 +506,7 @@ static VOID EvtRxStop(_In_ NETPACKETQUEUE Q)
 
 static VOID EvtRxAdvance(_In_ NETPACKETQUEUE Q)
 {
+    CB_ENTER(3);
     QUEUE_CTX *C = GetQueueCtx(Q);
     PNIC_DEVICE N = C->Nic;
     NET_RING *PR = NetRingCollectionGetPacketRing(C->Rings);
@@ -544,6 +565,7 @@ static VOID EvtRxAdvance(_In_ NETPACKETQUEUE Q)
 
 static VOID EvtRxCancel(_In_ NETPACKETQUEUE Q)
 {
+    CB_ENTER(4);
     QUEUE_CTX *C = GetQueueCtx(Q);
     PNIC_DEVICE N = C->Nic;
     NET_RING *PR = NetRingCollectionGetPacketRing(C->Rings);
@@ -561,6 +583,7 @@ static VOID EvtRxCancel(_In_ NETPACKETQUEUE Q)
 
 static VOID EvtRxSetNotify(_In_ NETPACKETQUEUE Q, _In_ BOOLEAN Enable)
 {
+    CB_ENTER(5);
     PNIC_DEVICE N = GetQueueCtx(Q)->Nic;
     if ((N->DataPath & 2) || !Enable) P(N, Enable ? GEM_IER : GEM_IDR, INT_RCOMP | INT_RXUBR);
 }
@@ -570,6 +593,7 @@ static VOID EvtRxSetNotify(_In_ NETPACKETQUEUE Q, _In_ BOOLEAN Enable)
 /* ------------------------------------------------------------------ */
 static VOID EvtTxStart(_In_ NETPACKETQUEUE Q)
 {
+    CB_ENTER(6);
     PNIC_DEVICE N = GetQueueCtx(Q)->Nic;
     ULONG i;
     UINT64 A = N->TxRingLa + N->DmaOffset;
@@ -589,6 +613,7 @@ static VOID EvtTxStart(_In_ NETPACKETQUEUE Q)
 
 static VOID EvtTxStop(_In_ NETPACKETQUEUE Q)
 {
+    CB_ENTER(7);
     PNIC_DEVICE N = GetQueueCtx(Q)->Nic;
     InterlockedOr(&N->Crumb, 4);
     P(N, GEM_NCR, G(N, GEM_NCR) & ~NCR_TE);
@@ -596,6 +621,7 @@ static VOID EvtTxStop(_In_ NETPACKETQUEUE Q)
 
 static VOID EvtTxAdvance(_In_ NETPACKETQUEUE Q)
 {
+    CB_ENTER(8);
     QUEUE_CTX *C = GetQueueCtx(Q);
     PNIC_DEVICE N = C->Nic;
     NET_RING *PR = NetRingCollectionGetPacketRing(C->Rings);
@@ -658,6 +684,7 @@ static VOID EvtTxAdvance(_In_ NETPACKETQUEUE Q)
 
 static VOID EvtTxCancel(_In_ NETPACKETQUEUE Q)
 {
+    CB_ENTER(9);
     QUEUE_CTX *C = GetQueueCtx(Q);
     NET_RING *PR = NetRingCollectionGetPacketRing(C->Rings);
     NET_RING *FR = NetRingCollectionGetFragmentRing(C->Rings);
@@ -673,6 +700,7 @@ static VOID EvtTxCancel(_In_ NETPACKETQUEUE Q)
 
 static VOID EvtTxSetNotify(_In_ NETPACKETQUEUE Q, _In_ BOOLEAN Enable)
 {
+    CB_ENTER(10);
     PNIC_DEVICE N = GetQueueCtx(Q)->Nic;
     if ((N->DataPath & 1) || !Enable) P(N, Enable ? GEM_IER : GEM_IDR, INT_TCOMP);
 }
@@ -682,6 +710,7 @@ static VOID EvtTxSetNotify(_In_ NETPACKETQUEUE Q, _In_ BOOLEAN Enable)
 /* ------------------------------------------------------------------ */
 static NTSTATUS EvtCreateRxQueue(_In_ NETADAPTER Adapter, _Inout_ NETRXQUEUE_INIT *Init)
 {
+    CB_ENTER(14);
     WDF_OBJECT_ATTRIBUTES A;
     NET_PACKET_QUEUE_CONFIG Cfg;
     NETPACKETQUEUE Q;
@@ -709,6 +738,7 @@ static NTSTATUS EvtCreateRxQueue(_In_ NETADAPTER Adapter, _Inout_ NETRXQUEUE_INI
 
 static NTSTATUS EvtCreateTxQueue(_In_ NETADAPTER Adapter, _Inout_ NETTXQUEUE_INIT *Init)
 {
+    CB_ENTER(15);
     WDF_OBJECT_ATTRIBUTES A;
     NET_PACKET_QUEUE_CONFIG Cfg;
     NETPACKETQUEUE Q;
@@ -737,6 +767,7 @@ static NTSTATUS EvtCreateTxQueue(_In_ NETADAPTER Adapter, _Inout_ NETTXQUEUE_INI
 /* Receive filter: the GEM is run with copy-all-frames for now. */
 static VOID EvtSetReceiveFilter(_In_ NETADAPTER Adapter, _In_ NETRECEIVEFILTER Filter)
 {
+    CB_ENTER(11);
     UNREFERENCED_PARAMETER(Adapter);
     UNREFERENCED_PARAMETER(Filter);
 }
