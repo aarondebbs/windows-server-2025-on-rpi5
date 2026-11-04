@@ -21,6 +21,9 @@ NetAdapterCx docs/sample, and has not been built or run.
   clock stays at 125 MHz. Set 0 to allow 10/100 (clock divider unverified).
 - `MacAddress` (REG_BINARY 6): generated on first start if the GEM has none.
 
+- `DataPath` (DWORD, default 0): bit 0 enables the TX engine, bit 1 the RX engine
+  (1 = TX only, 2 = RX only, 3 = both, 0 = link only).
+
 ## Open problems
 1. DMA addressing and cache coherency through the RP1 PCIe bridge.
 2. 10/100 TX clock divider (guess: 125 MHz / 5 or / 50).

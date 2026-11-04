@@ -156,7 +156,7 @@ typedef struct _NIC_DEVICE {
     BOOLEAN Addr64;     /* GEM supports 64-bit descriptors (DCFG6.DAW64) */
     ULONG  DescStride;  /* 16 (64-bit) or 8 (32-bit) bytes per descriptor */
     ULONG  OnlyGigabit;
-    ULONG  DataPath;      /* 0 = link only (no DMA engines), 1 = full data path */
+    ULONG  DataPath;      /* bit mask: 1 = TX engine, 2 = RX engine, 3 = both, 0 = link only */
     UCHAR  Mac[6];
     BOOLEAN PhyUp;
     BOOLEAN LinkUp;
@@ -444,7 +444,7 @@ static VOID EvtRxStart(_In_ NETPACKETQUEUE Q)
     P(N, GEM_RBQP, (ULONG)A);
     if (N->Addr64) P(N, GEM_RBQPH, (ULONG)(A >> 32));
     TRACEVAL(L"RxQueueStarted", N->DataPath);
-    if (N->DataPath) P(N, GEM_NCR, G(N, GEM_NCR) | NCR_RE);
+    if (N->DataPath & 2) P(N, GEM_NCR, G(N, GEM_NCR) | NCR_RE);
 }
 
 static VOID EvtRxStop(_In_ NETPACKETQUEUE Q)
@@ -529,7 +529,7 @@ static VOID EvtRxCancel(_In_ NETPACKETQUEUE Q)
 static VOID EvtRxSetNotify(_In_ NETPACKETQUEUE Q, _In_ BOOLEAN Enable)
 {
     PNIC_DEVICE N = GetQueueCtx(Q)->Nic;
-    if (N->DataPath || !Enable) P(N, Enable ? GEM_IER : GEM_IDR, INT_RCOMP | INT_RXUBR);
+    if ((N->DataPath & 2) || !Enable) P(N, Enable ? GEM_IER : GEM_IDR, INT_RCOMP | INT_RXUBR);
 }
 
 /* ------------------------------------------------------------------ */
@@ -551,7 +551,7 @@ static VOID EvtTxStart(_In_ NETPACKETQUEUE Q)
     P(N, GEM_TBQP, (ULONG)A);
     if (N->Addr64) P(N, GEM_TBQPH, (ULONG)(A >> 32));
     TRACEVAL(L"TxQueueStarted", N->DataPath);
-    if (N->DataPath) P(N, GEM_NCR, G(N, GEM_NCR) | NCR_TE);
+    if (N->DataPath & 1) P(N, GEM_NCR, G(N, GEM_NCR) | NCR_TE);
 }
 
 static VOID EvtTxStop(_In_ NETPACKETQUEUE Q)
@@ -596,7 +596,7 @@ static VOID EvtTxAdvance(_In_ NETPACKETQUEUE Q)
         idx = NetRingIncrementIndex(PR, idx);
     }
     PR->NextIndex = idx;
-    if (Posted && N->DataPath) {
+    if (Posted && (N->DataPath & 1)) {
         KeMemoryBarrier();
         P(N, GEM_NCR, G(N, GEM_NCR) | NCR_TSTART);
     }
@@ -634,7 +634,7 @@ static VOID EvtTxCancel(_In_ NETPACKETQUEUE Q)
 static VOID EvtTxSetNotify(_In_ NETPACKETQUEUE Q, _In_ BOOLEAN Enable)
 {
     PNIC_DEVICE N = GetQueueCtx(Q)->Nic;
-    if (N->DataPath || !Enable) P(N, Enable ? GEM_IER : GEM_IDR, INT_TCOMP);
+    if ((N->DataPath & 1) || !Enable) P(N, Enable ? GEM_IER : GEM_IDR, INT_TCOMP);
 }
 
 /* ------------------------------------------------------------------ */
