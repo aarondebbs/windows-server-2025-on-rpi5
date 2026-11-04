@@ -36,6 +36,7 @@
 #define GEM_IER         0x028
 #define GEM_IDR         0x02C
 #define GEM_MAN         0x034
+#define GEM_AMP         0x054         /* AXI max pipeline (Linux GEM_AMP): AR2R bits 7:0, AW2W bits 15:8, AW2B_FILL bit 16 */
 #define GEM_SA1B        0x098
 #define GEM_SA1T        0x09C
 #define GEM_USRIO       0x0C0
@@ -58,6 +59,7 @@
 #define NCFGR_BIG       (1UL << 8)
 #define NCFGR_GBE       (1UL << 10)
 #define NCFGR_DRFCS     (1UL << 17)
+#define NCFGR_DBW_SHIFT 21            /* data bus width: 0 = 32, 1 = 64, 2 = 128 bit (Linux macb_dbw()) */
 #define NCFGR_CLK_DIV224 (7UL << 18)
 #define NCFGR_CLK_MASK  (7UL << 18)
 
@@ -172,7 +174,9 @@ typedef struct _NIC_DEVICE {
     volatile LONG CntRxZero, CntRxFF, CntRxOther;   /* RX frame content probe: first 6 bytes all 0 / all FF / other */
     ULONG  RxSampleW[12], RxSampleCtrl, RxSampleAddr, RxSampleAddrHi; volatile LONG RxSampleSet;
     volatile LONG ProbeSet; ULONG ProbeTbqp[8], ProbeTsr[8], ProbeD0[8], ProbeD1[8];   /* TX start dynamics probe */
-    ULONG  TsuClk;      /* registry TsuClk: 1 = enable clk_eth_tsu (ctrl 0x134 bit 11), 2 = also select aux source 0 (xosc, 50 MHz) */
+    ULONG  NoDbw, NoAmp;            /* registry NoDbw / NoAmp = 1: skip the Linux NCFGR data-bus-width / GEM_AMP AXI-pipeline setup */
+    ULONG  DbwDef, DbwSet, AmpBefore, AmpAfter, NcfgrSet;   /* DCFG1.DBWDEF, NCFGR.DBW we programmed, GEM_AMP before/after, NCFGR we wrote */
+    ULONG  TsuClk;      /* registry TsuClk (default 1): 1 = enable clk_eth_tsu (ctrl 0x134 bit 11), 2 = also select aux source 0 (xosc, 50 MHz), 0 = leave alone */
     ULONG  TsuBefore[4], TsuAfter[4];
     ULONG  TxScan;      /* registry TxScan: 1 = at TX start, probe which (address offset, descriptor size) makes the TX engine stop on an all-ones ring */
     ULONG  ScN, ScHi[16], ScA64[16], ScB[16], ScS1[16], ScT1[16], ScS2[16], ScT2[16];
@@ -463,6 +467,9 @@ static VOID EvtLinkTimer(_In_ WDFTIMER Timer)
         }
     }
     TRACEVAL(L"TsuClk", N->TsuClk);
+    TRACEVAL(L"DbwDef", N->DbwDef);        TRACEVAL(L"DbwSet", N->DbwSet);
+    TRACEVAL(L"NcfgrSet", N->NcfgrSet);
+    TRACEVAL(L"AmpBefore", N->AmpBefore);  TRACEVAL(L"AmpAfter", N->AmpAfter);
     TRACEVAL(L"ClkLen", (ULONG)N->ClkLen);
     TRACEVAL(L"CfgLen", (ULONG)N->CfgLen);
     TRACEVAL(L"TsuB_134", N->TsuBefore[0]); TRACEVAL(L"TsuB_138", N->TsuBefore[1]);
@@ -845,16 +852,7 @@ static VOID EvtTxStart(_In_ NETPACKETQUEUE Q)
     N->TeOn = TRUE;
     TRACEVAL(L"TxS_TbqpTe", G(N, GEM_TBQP));
     TRACEVAL(L"TxS_TsrTe", G(N, GEM_TSR));
-    if (!N->TxScan) {
-        /* Idle probe: every descriptor is software-owned, so TSTART must make the engine halt at once. */
-        ULONG j;
-        P(N, GEM_NCR, G(N, GEM_NCR) | NCR_TSTART);
-        for (j = 0; j < 4; j++) {
-            KeStallExecutionProcessor(j == 0 ? 0 : (j == 1 ? 10 : (j == 2 ? 50 : 40)));
-            N->QTbqp[j] = G(N, GEM_TBQP);
-            N->QTsr[j] = G(N, GEM_TSR);
-        }
-    }
+    /* No idle TSTART here: Linux only sets TSTART after a frame has been posted. */
 }
 
 static VOID EvtTxStop(_In_ NETPACKETQUEUE Q)
@@ -1062,7 +1060,8 @@ static VOID LoadSettings(PNIC_DEVICE N)
 
     N->DmaOffset = 0;
     N->OnlyGigabit = 1;
-    N->DataPath = 0;
+    N->DataPath = 3;        /* TX + RX engines on by default */
+    N->TsuClk = 1;          /* Linux enables clk_eth_tsu; our firmware never does */
     N->PollSec = 1;
     N->Dma32 = 1;
 
@@ -1084,6 +1083,10 @@ static VOID LoadSettings(PNIC_DEVICE N)
             if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NDma32, &V))) N->Dma32 = V;
             DECLARE_CONST_UNICODE_STRING(NTsu, L"TsuClk");
             if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NTsu, &V))) N->TsuClk = V;
+            DECLARE_CONST_UNICODE_STRING(NNoDbw, L"NoDbw");
+            if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NNoDbw, &V))) N->NoDbw = V;
+            DECLARE_CONST_UNICODE_STRING(NNoAmp, L"NoAmp");
+            if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NNoAmp, &V))) N->NoAmp = V;
             DECLARE_CONST_UNICODE_STRING(NScan, L"TxScan");
             if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NScan, &V))) N->TxScan = V;
             DECLARE_CONST_UNICODE_STRING(NF32, L"Force32");
@@ -1297,7 +1300,31 @@ static NTSTATUS EvtD0Entry(_In_ WDFDEVICE Device, _In_ WDF_POWER_DEVICE_STATE Pr
     P(N, GEM_NCR, 0);
     P(N, GEM_NCR, NCR_CLRSTAT);
     P(N, GEM_USRIO, USRIO_RGMII);
-    P(N, GEM_NCFGR, NCFGR_CLK_DIV224 | NCFGR_DRFCS | NCFGR_BIG | NCFGR_CAF);
+
+    /* Linux macb_init_hw(): NCFGR carries the AXI data bus width taken from DCFG1.DBWDEF (macb_dbw()). This
+     * GEM sits on a 128-bit bus (DBWDEF = 4); with the field left at 0 the DMA assumes a 32-bit bus and
+     * fetches/stores descriptors and data in the wrong lanes. */
+    {
+        ULONG Cfg = NCFGR_CLK_DIV224 | NCFGR_DRFCS | NCFGR_BIG | NCFGR_CAF;
+        ULONG Dbw = 0;
+        N->DbwDef = (G(N, GEM_DCFG1) >> 25) & 7;
+        if (N->DbwDef == 4) Dbw = 2; else if (N->DbwDef == 2) Dbw = 1;
+        if (!N->NoDbw) Cfg |= Dbw << NCFGR_DBW_SHIFT;
+        N->DbwSet = N->NoDbw ? 0 : Dbw;
+        N->NcfgrSet = Cfg;
+        P(N, GEM_NCFGR, Cfg);
+    }
+
+    /* Linux gem_init_axi() with the RP1 devicetree values (cdns,ar2r-max-pipe = 8, cdns,aw2w-max-pipe = 8,
+     * cdns,use-aw2b-fill): GEM_AMP AR2R[7:0] = 8, AW2W[15:8] = 8, AW2B_FILL[16] = 1. */
+    N->AmpBefore = G(N, GEM_AMP);
+    if (!N->NoAmp) {
+        ULONG Amp = N->AmpBefore & ~0x1FFFFUL;
+        Amp |= 8UL | (8UL << 8) | (1UL << 16);
+        P(N, GEM_AMP, Amp);
+    }
+    N->AmpAfter = G(N, GEM_AMP);
+
     P(N, GEM_DMACFG, DMACFG_FBLDO16 | DMACFG_RXBMS | DMACFG_TXPBMS |
                      DMACFG_RXBS(RX_BUF_SIZE / 64) | (N->Addr64 ? DMACFG_ADDR64 : 0));
     Mac4 = N->Mac[0] | (N->Mac[1] << 8) | (N->Mac[2] << 16) | ((ULONG)N->Mac[3] << 24);
@@ -1383,11 +1410,11 @@ static NTSTATUS EvtDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT Devi
     N = GetNic(Device);
     N->Device = Device;
 
-    /* The RP1 ETH interrupt is only connected when the registry value EnableIrq (DWORD, Device Parameters) is non-zero.
-     * Default is OFF while we hunt the idle freeze: an interrupt that never deasserts would hang the CPU. */
+    /* The RP1 ETH interrupt is connected unless the registry value EnableIrq (DWORD, Device Parameters) is 0.
+     * RX needs it: without interrupts nothing ever wakes the driver. */
     {
         WDFKEY K;
-        ULONG En = 0;
+        ULONG En = 1;
         DECLARE_CONST_UNICODE_STRING(NEn, L"EnableIrq");
         if (NT_SUCCESS(WdfDeviceOpenRegistryKey(Device, PLUGPLAY_REGKEY_DEVICE, KEY_READ,
                                                 WDF_NO_OBJECT_ATTRIBUTES, &K))) {
