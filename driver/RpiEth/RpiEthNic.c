@@ -162,6 +162,7 @@ typedef struct _NIC_DEVICE {
     volatile BOOLEAN Polling;
     USHORT DbgBmsr, DbgLpa, Dbg1000St, DbgAux19, DbgBmcr;
     ULONG  PollCount;
+    volatile LONG Crumb;   /* stop-path breadcrumbs: 1 RxStop 2 RxCancel 4 TxStop 8 TxCancel 0x10 D0Exit 0x20 timer stopped 0x40 D0Exit done 0x80 ReleaseHw */
     BOOLEAN LinkUp;
     ULONG   LinkMbps;
 } NIC_DEVICE, *PNIC_DEVICE;
@@ -374,6 +375,7 @@ static VOID EvtLinkTimer(_In_ WDFTIMER Timer)
     PhyReadLink(N, &Up, &Mbps, &Full);
     N->PollCount++;
     TRACEVAL(L"PollCount", N->PollCount);
+    TRACEVAL(L"StopCrumb", N->Crumb);
     TRACEVAL(L"PhyBmcr", N->DbgBmcr);
     TRACEVAL(L"PhyBmsr", N->DbgBmsr);
     TRACEVAL(L"PhyLpa", N->DbgLpa);
@@ -466,6 +468,7 @@ static VOID EvtRxStart(_In_ NETPACKETQUEUE Q)
 static VOID EvtRxStop(_In_ NETPACKETQUEUE Q)
 {
     PNIC_DEVICE N = GetQueueCtx(Q)->Nic;
+    InterlockedOr(&N->Crumb, 1);
     P(N, GEM_NCR, G(N, GEM_NCR) & ~NCR_RE);
 }
 
@@ -534,6 +537,7 @@ static VOID EvtRxCancel(_In_ NETPACKETQUEUE Q)
     NET_RING *FR = NetRingCollectionGetFragmentRing(C->Rings);
     UINT32 i;
 
+    InterlockedOr(&N->Crumb, 2);
     P(N, GEM_NCR, G(N, GEM_NCR) & ~NCR_RE);
     for (i = PR->BeginIndex; i != PR->EndIndex; i = NetRingIncrementIndex(PR, i)) {
         NetRingGetPacketAtIndex(PR, i)->Ignore = 1;
@@ -573,6 +577,7 @@ static VOID EvtTxStart(_In_ NETPACKETQUEUE Q)
 static VOID EvtTxStop(_In_ NETPACKETQUEUE Q)
 {
     PNIC_DEVICE N = GetQueueCtx(Q)->Nic;
+    InterlockedOr(&N->Crumb, 4);
     P(N, GEM_NCR, G(N, GEM_NCR) & ~NCR_TE);
 }
 
@@ -640,11 +645,15 @@ static VOID EvtTxCancel(_In_ NETPACKETQUEUE Q)
 {
     QUEUE_CTX *C = GetQueueCtx(Q);
     NET_RING *PR = NetRingCollectionGetPacketRing(C->Rings);
+    NET_RING *FR = NetRingCollectionGetFragmentRing(C->Rings);
     UINT32 i;
+    InterlockedOr(&C->Nic->Crumb, 8);
+    P(C->Nic, GEM_NCR, G(C->Nic, GEM_NCR) & ~NCR_TE);
     for (i = PR->BeginIndex; i != PR->EndIndex; i = NetRingIncrementIndex(PR, i)) {
         NetRingGetPacketAtIndex(PR, i)->Scratch = 1;
     }
     PR->BeginIndex = PR->EndIndex;
+    FR->BeginIndex = FR->EndIndex;
 }
 
 static VOID EvtTxSetNotify(_In_ NETPACKETQUEUE Q, _In_ BOOLEAN Enable)
@@ -942,12 +951,18 @@ static NTSTATUS EvtD0Exit(_In_ WDFDEVICE Device, _In_ WDF_POWER_DEVICE_STATE Tar
 {
     PNIC_DEVICE N = GetNic(Device);
     UNREFERENCED_PARAMETER(Target);
+    InterlockedOr(&N->Crumb, 0x10);
+    TRACEVAL(L"StopCrumb", N->Crumb);
     N->Polling = FALSE;
     WdfTimerStop(N->LinkTimer, TRUE);
+    InterlockedOr(&N->Crumb, 0x20);
+    TRACEVAL(L"StopCrumb", N->Crumb);
     if (N->Gem) {
         P(N, GEM_IDR, 0xFFFFFFFF);
         P(N, GEM_NCR, G(N, GEM_NCR) & ~(NCR_RE | NCR_TE));
     }
+    InterlockedOr(&N->Crumb, 0x40);
+    TRACEVAL(L"StopCrumb", N->Crumb);
     return STATUS_SUCCESS;
 }
 
