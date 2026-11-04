@@ -910,40 +910,46 @@ static VOID LoadSettings(PNIC_DEVICE N)
     if (Key) WdfRegistryClose(Key);
 }
 
+/* Uncached, physically contiguous memory for the descriptor rings and packet pools. The GEM does not
+ * snoop the CPU caches, so cached buffers (what the framework's common buffers can be) let it read stale
+ * zeros instead of the descriptors we wrote. */
+static PVOID AllocUncached(PNIC_DEVICE N, SIZE_T Bytes, UINT64 *Pa)
+{
+    PHYSICAL_ADDRESS Lo, Hi, Bnd;
+    PVOID Va;
+    Lo.QuadPart = 0;
+    Hi.QuadPart = N->Dma32 ? 0xFFFFFFFFLL : 0x0000FFFFFFFFFFFFLL;
+    Bnd.QuadPart = 0;
+    Va = MmAllocateContiguousMemorySpecifyCache(Bytes, Lo, Hi, Bnd, MmNonCached);
+    if (!Va) return NULL;
+    RtlZeroMemory(Va, Bytes);
+    *Pa = (UINT64)MmGetPhysicalAddress(Va).QuadPart;
+    return Va;
+}
+
+static VOID FreeUncached(PVOID *Va, SIZE_T Bytes)
+{
+    if (*Va) { MmFreeContiguousMemorySpecifyCache(*Va, Bytes, MmNonCached); *Va = NULL; }
+}
+
+static VOID FreeRings(PNIC_DEVICE N)
+{
+    FreeUncached((PVOID *)&N->RxRing, RING_SIZE * sizeof(GEM_DESC));
+    FreeUncached((PVOID *)&N->TxRing, RING_SIZE * sizeof(GEM_DESC));
+    FreeUncached((PVOID *)&N->RxPool, (SIZE_T)RING_SIZE * RX_BUF_SIZE);
+    FreeUncached((PVOID *)&N->TxPool, (SIZE_T)RING_SIZE * RX_BUF_SIZE);
+}
+
 static NTSTATUS CreateRings(PNIC_DEVICE N)
 {
-    PHYSICAL_ADDRESS Pa;
-    NTSTATUS S;
-    SIZE_T Sz = RING_SIZE * sizeof(GEM_DESC);
-
-    S = WdfCommonBufferCreate(N->Dma, Sz, WDF_NO_OBJECT_ATTRIBUTES, &N->RxRingBuf);
-    if (!NT_SUCCESS(S)) return S;
-    S = WdfCommonBufferCreate(N->Dma, Sz, WDF_NO_OBJECT_ATTRIBUTES, &N->TxRingBuf);
-    if (!NT_SUCCESS(S)) return S;
-
-    N->RxRing = (GEM_DESC *)WdfCommonBufferGetAlignedVirtualAddress(N->RxRingBuf);
-    Pa = WdfCommonBufferGetAlignedLogicalAddress(N->RxRingBuf);
-    N->RxRingLa = (UINT64)Pa.QuadPart;
-    N->TxRing = (GEM_DESC *)WdfCommonBufferGetAlignedVirtualAddress(N->TxRingBuf);
-    Pa = WdfCommonBufferGetAlignedLogicalAddress(N->TxRingBuf);
-    N->TxRingLa = (UINT64)Pa.QuadPart;
-    RtlZeroMemory(N->RxRing, Sz);
-    RtlZeroMemory(N->TxRing, Sz);
-
-    /* Packet buffer pools owned by the driver (same coherent memory type as the rings). */
-    Sz = (SIZE_T)RING_SIZE * RX_BUF_SIZE;
-    S = WdfCommonBufferCreate(N->Dma, Sz, WDF_NO_OBJECT_ATTRIBUTES, &N->RxPoolBuf);
-    if (!NT_SUCCESS(S)) return S;
-    S = WdfCommonBufferCreate(N->Dma, Sz, WDF_NO_OBJECT_ATTRIBUTES, &N->TxPoolBuf);
-    if (!NT_SUCCESS(S)) return S;
-    N->RxPool = (PUCHAR)WdfCommonBufferGetAlignedVirtualAddress(N->RxPoolBuf);
-    Pa = WdfCommonBufferGetAlignedLogicalAddress(N->RxPoolBuf);
-    N->RxPoolLa = (UINT64)Pa.QuadPart;
-    N->TxPool = (PUCHAR)WdfCommonBufferGetAlignedVirtualAddress(N->TxPoolBuf);
-    Pa = WdfCommonBufferGetAlignedLogicalAddress(N->TxPoolBuf);
-    N->TxPoolLa = (UINT64)Pa.QuadPart;
-    RtlZeroMemory(N->RxPool, Sz);
-    RtlZeroMemory(N->TxPool, Sz);
+    N->RxRing = (GEM_DESC *)AllocUncached(N, RING_SIZE * sizeof(GEM_DESC), &N->RxRingLa);
+    N->TxRing = (GEM_DESC *)AllocUncached(N, RING_SIZE * sizeof(GEM_DESC), &N->TxRingLa);
+    N->RxPool = (PUCHAR)AllocUncached(N, (SIZE_T)RING_SIZE * RX_BUF_SIZE, &N->RxPoolLa);
+    N->TxPool = (PUCHAR)AllocUncached(N, (SIZE_T)RING_SIZE * RX_BUF_SIZE, &N->TxPoolLa);
+    if (!N->RxRing || !N->TxRing || !N->RxPool || !N->TxPool) {
+        FreeRings(N);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
     return STATUS_SUCCESS;
 }
 
@@ -986,7 +992,6 @@ static NTSTATUS EvtPrepareHardware(_In_ WDFDEVICE Device, _In_ WDFCMRESLIST Raw,
 {
     PNIC_DEVICE N = GetNic(Device);
     ULONG Count = WdfCmResourceListGetCount(Tr), i, Idx = 0;
-    WDF_DMA_ENABLER_CONFIG DC;
     NTSTATUS S;
     UNREFERENCED_PARAMETER(Raw);
 
@@ -1025,9 +1030,6 @@ static NTSTATUS EvtPrepareHardware(_In_ WDFDEVICE Device, _In_ WDFCMRESLIST Raw,
         TRACEVAL(L"GemModuleIdSeen", G(N, GEM_MID));
     }
     if (N->NoDma != 1) {
-        WDF_DMA_ENABLER_CONFIG_INIT(&DC, (N->Addr64 && !N->Dma32) ? WdfDmaProfileScatterGather64 : WdfDmaProfileScatterGather, 0x10000);
-        DC.WdmDmaVersionOverride = 3;
-        STEP(13, WdfDmaEnablerCreate(Device, &DC, WDF_NO_OBJECT_ATTRIBUTES, &N->Dma));
         STEP(14, CreateRings(N));
     }
     SetCapabilities(N);
@@ -1041,6 +1043,7 @@ static NTSTATUS EvtReleaseHardware(_In_ WDFDEVICE Device, _In_ WDFCMRESLIST Tr)
 {
     PNIC_DEVICE N = GetNic(Device);
     UNREFERENCED_PARAMETER(Tr);
+    FreeRings(N);
     if (N->Gem)  { MmUnmapIoSpace(N->Gem,  N->GemLen);  N->Gem = NULL; }
     if (N->Cfg)  { MmUnmapIoSpace(N->Cfg,  N->CfgLen);  N->Cfg = NULL; }
     if (N->Gpio) { MmUnmapIoSpace(N->Gpio, N->GpioLen); N->Gpio = NULL; }
