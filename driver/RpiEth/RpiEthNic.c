@@ -171,6 +171,7 @@ typedef struct _NIC_DEVICE {
     ULONG  Dma32;       /* registry Dma32 (default 1): keep every driver DMA buffer below 4 GB */
     volatile LONG CntRxZero, CntRxFF, CntRxOther;   /* RX frame content probe: first 6 bytes all 0 / all FF / other */
     ULONG  RxSampleW[12], RxSampleCtrl, RxSampleAddr, RxSampleAddrHi; volatile LONG RxSampleSet;
+    volatile LONG ProbeSet; ULONG ProbeTbqp[8], ProbeTsr[8], ProbeD0[8], ProbeD1[8];   /* TX start dynamics probe */
     ULONG  PollSec;     /* registry PollSec: link poll interval in seconds, 0 = no polling (link forced up at 1000/full) */
     volatile LONG CntTxStart, CntRxStart, CntTxPosted, CntTxDone, CntRxDone;  /* data-path counters, published by the link timer */
     volatile LONG Crumb;   /* stop-path breadcrumbs: 1 RxStop 2 RxCancel 4 TxStop 8 TxCancel 0x10 D0Exit 0x20 timer stopped 0x40 D0Exit done 0x80 ReleaseHw */
@@ -441,6 +442,17 @@ static VOID EvtLinkTimer(_In_ WDFTIMER Timer)
                 RtlInitUnicodeString(&us, nm);
                 TraceVal(&us, v);
             }
+        }
+    }
+    if (N->ProbeSet) {
+        ULONG i;
+        for (i = 0; i < 8; i++) {
+            WCHAR nm[24];
+            UNICODE_STRING us;
+            RtlStringCchPrintfW(nm, 24, L"P%u_Tbqp", i);  RtlInitUnicodeString(&us, nm); TraceVal(&us, N->ProbeTbqp[i]);
+            RtlStringCchPrintfW(nm, 24, L"P%u_Tsr", i);   RtlInitUnicodeString(&us, nm); TraceVal(&us, N->ProbeTsr[i]);
+            RtlStringCchPrintfW(nm, 24, L"P%u_D0", i);    RtlInitUnicodeString(&us, nm); TraceVal(&us, N->ProbeD0[i]);
+            RtlStringCchPrintfW(nm, 24, L"P%u_D1", i);    RtlInitUnicodeString(&us, nm); TraceVal(&us, N->ProbeD1[i]);
         }
     }
     TRACEVAL(L"RxZero", N->CntRxZero);
@@ -786,9 +798,23 @@ static VOID EvtTxAdvance(_In_ NETPACKETQUEUE Q)
     }
     PR->BeginIndex = pi;
 
-    if (Posted) {
+    if (Posted || (N->TxClean != N->TxPost && Live)) {
         KeMemoryBarrier();
-        P(N, GEM_NCR, G(N, GEM_NCR) | NCR_TSTART);
+        P(N, GEM_NCR, G(N, GEM_NCR) | NCR_TSTART);   /* re-kick: Linux sees lost TSTART writes on this MAC */
+    }
+    if (Posted && !N->ProbeSet) {
+        static const ULONG Us[8] = { 0, 2, 10, 50, 200, 1000, 5000, 20000 };
+        ULONG i, t = 0;
+        N->ProbeSet = 1;
+        for (i = 0; i < 8; i++) {
+            ULONG w = Us[i] - t;
+            while (w) { ULONG c = w > 50 ? 50 : w; KeStallExecutionProcessor(c); w -= c; }
+            t = Us[i];
+            N->ProbeTbqp[i] = G(N, GEM_TBQP);
+            N->ProbeTsr[i] = G(N, GEM_TSR);
+            N->ProbeD0[i] = N->TxRing[0].Ctrl;
+            N->ProbeD1[i] = N->TxRing[1].Ctrl;
+        }
     }
 }
 
