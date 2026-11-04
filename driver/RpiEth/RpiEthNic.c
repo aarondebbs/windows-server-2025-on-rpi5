@@ -162,6 +162,7 @@ typedef struct _NIC_DEVICE {
     volatile BOOLEAN Polling;
     USHORT DbgBmsr, DbgLpa, Dbg1000St, DbgAux19, DbgBmcr;
     ULONG  PollCount;
+    volatile LONG CntTxStart, CntRxStart, CntTxPosted, CntTxDone, CntRxDone;  /* data-path counters, published by the link timer */
     volatile LONG Crumb;   /* stop-path breadcrumbs: 1 RxStop 2 RxCancel 4 TxStop 8 TxCancel 0x10 D0Exit 0x20 timer stopped 0x40 D0Exit done 0x80 ReleaseHw */
     BOOLEAN LinkUp;
     ULONG   LinkMbps;
@@ -376,6 +377,16 @@ static VOID EvtLinkTimer(_In_ WDFTIMER Timer)
     N->PollCount++;
     TRACEVAL(L"PollCount", N->PollCount);
     TRACEVAL(L"StopCrumb", N->Crumb);
+    TRACEVAL(L"CntTxStart", N->CntTxStart);
+    TRACEVAL(L"CntRxStart", N->CntRxStart);
+    TRACEVAL(L"CntTxPosted", N->CntTxPosted);
+    TRACEVAL(L"CntTxDone", N->CntTxDone);
+    TRACEVAL(L"CntRxDone", N->CntRxDone);
+    if (N->Gem) {
+        TRACEVAL(L"GemNcr", G(N, GEM_NCR));
+        TRACEVAL(L"GemTsr", G(N, GEM_TSR));
+        TRACEVAL(L"GemRsr", G(N, GEM_RSR));
+    }
     TRACEVAL(L"PhyBmcr", N->DbgBmcr);
     TRACEVAL(L"PhyBmsr", N->DbgBmsr);
     TRACEVAL(L"PhyLpa", N->DbgLpa);
@@ -461,7 +472,7 @@ static VOID EvtRxStart(_In_ NETPACKETQUEUE Q)
     N->RxPost = N->RxClean = 0;
     P(N, GEM_RBQP, (ULONG)A);
     if (N->Addr64) P(N, GEM_RBQPH, (ULONG)(A >> 32));
-    TRACEVAL(L"RxQueueStarted", N->DataPath);
+    InterlockedIncrement(&N->CntRxStart);
     if (N->DataPath & 2) P(N, GEM_NCR, G(N, GEM_NCR) | NCR_RE);
 }
 
@@ -505,6 +516,7 @@ static VOID EvtRxAdvance(_In_ NETPACKETQUEUE Q)
         }
 
         N->RxClean++;
+        InterlockedIncrement(&N->CntRxDone);
         fi = NetRingIncrementIndex(FR, fi);
         pi = NetRingIncrementIndex(PR, pi);
     }
@@ -570,7 +582,7 @@ static VOID EvtTxStart(_In_ NETPACKETQUEUE Q)
     N->TxPost = N->TxClean = 0;
     P(N, GEM_TBQP, (ULONG)A);
     if (N->Addr64) P(N, GEM_TBQPH, (ULONG)(A >> 32));
-    TRACEVAL(L"TxQueueStarted", N->DataPath);
+    InterlockedIncrement(&N->CntTxStart);
     if (N->DataPath & 1) P(N, GEM_NCR, G(N, GEM_NCR) | NCR_TE);
 }
 
@@ -611,6 +623,7 @@ static VOID EvtTxAdvance(_In_ NETPACKETQUEUE Q)
             D->Ctrl = TXD_LEN(F->ValidLength) | TXD_LAST |
                       (((N->TxPost % RING_SIZE) == RING_SIZE - 1) ? TXD_WRAP : 0);
             N->TxPost++;
+            InterlockedIncrement(&N->CntTxPosted);
             FR->NextIndex = NetRingIncrementIndex(FR, Pk->FragmentIndex);
             Posted = TRUE;
         }
@@ -632,6 +645,7 @@ static VOID EvtTxAdvance(_In_ NETPACKETQUEUE Q)
             if (N->TxClean == N->TxPost) break;
             if (!(TxD(N, N->TxClean)->Ctrl & TXD_USED)) break;
             N->TxClean++;
+            InterlockedIncrement(&N->CntTxDone);
         }
         f = Pk->FragmentIndex;
         for (k = 0; k < Pk->FragmentCount; k++) f = NetRingIncrementIndex(FR, f);
