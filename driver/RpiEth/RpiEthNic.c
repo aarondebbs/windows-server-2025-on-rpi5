@@ -159,6 +159,9 @@ typedef struct _NIC_DEVICE {
     ULONG  DataPath;      /* bit mask: 1 = TX engine, 2 = RX engine, 3 = both, 0 = link only */
     UCHAR  Mac[6];
     BOOLEAN PhyUp;
+    volatile BOOLEAN Polling;
+    USHORT DbgBmsr, DbgLpa, Dbg1000St, DbgAux19, DbgBmcr;
+    ULONG  PollCount;
     BOOLEAN LinkUp;
     ULONG   LinkMbps;
 } NIC_DEVICE, *PNIC_DEVICE;
@@ -312,11 +315,15 @@ static NTSTATUS PhyBringUp(PNIC_DEVICE N)
 static VOID PhyReadLink(PNIC_DEVICE N, BOOLEAN *Up, ULONG *Mbps, BOOLEAN *Full)
 {
     USHORT S = 0, St1000 = 0, Lpa = 0;
+    USHORT Aux = 0, Bmcr = 0;
     *Up = FALSE; *Mbps = 0; *Full = FALSE;
+    (VOID)PhyRd(N, 0, &Bmcr);
     if (!PhyRd(N, 1, &S) || !PhyRd(N, 1, &S)) return;
-    if (!(S & 0x0004)) return;
     (VOID)PhyRd(N, 10, &St1000);
     (VOID)PhyRd(N, 5, &Lpa);
+    (VOID)PhyRd(N, 0x19, &Aux);              /* Broadcom aux status summary */
+    N->DbgBmcr = Bmcr; N->DbgBmsr = S; N->DbgLpa = Lpa; N->Dbg1000St = St1000; N->DbgAux19 = Aux;
+    if (!(S & 0x0004)) return;
     *Up = TRUE;
     if (St1000 & (1 << 11))      { *Mbps = 1000; *Full = TRUE; }
     else if (St1000 & (1 << 10)) { *Mbps = 1000; *Full = FALSE; }
@@ -362,8 +369,16 @@ static VOID EvtLinkTimer(_In_ WDFTIMER Timer)
     BOOLEAN Up, Full;
     ULONG Mbps;
 
-    if (!N->PhyUp) return;
+    if (!N->Polling) return;
+    if (!N->PhyUp) { WdfTimerStart(Timer, WDF_REL_TIMEOUT_IN_SEC(1)); return; }
     PhyReadLink(N, &Up, &Mbps, &Full);
+    N->PollCount++;
+    TRACEVAL(L"PollCount", N->PollCount);
+    TRACEVAL(L"PhyBmcr", N->DbgBmcr);
+    TRACEVAL(L"PhyBmsr", N->DbgBmsr);
+    TRACEVAL(L"PhyLpa", N->DbgLpa);
+    TRACEVAL(L"Phy1000St", N->Dbg1000St);
+    TRACEVAL(L"PhyAux19", N->DbgAux19);
     if (Up != N->LinkUp || (Up && Mbps != N->LinkMbps)) {
         if (Up) SetMacSpeed(N, Mbps, Full);
         N->LinkUp = Up;
@@ -372,6 +387,7 @@ static VOID EvtLinkTimer(_In_ WDFTIMER Timer)
         TRACEVAL(L"LinkMbps", Mbps);
         PublishLink(N, Up, Mbps, Full);
     }
+    if (N->Polling) WdfTimerStart(Timer, WDF_REL_TIMEOUT_IN_SEC(1));
 }
 
 /* ------------------------------------------------------------------ */
@@ -916,6 +932,7 @@ static NTSTATUS EvtD0Entry(_In_ WDFDEVICE Device, _In_ WDF_POWER_DEVICE_STATE Pr
     }
     N->LinkUp = FALSE;
     PublishLink(N, FALSE, 0, FALSE);
+    N->Polling = TRUE;
     WdfTimerStart(N->LinkTimer, WDF_REL_TIMEOUT_IN_SEC(1));
     Trace(22, STATUS_SUCCESS);         /* D0 entry finished */
     return STATUS_SUCCESS;
@@ -925,6 +942,7 @@ static NTSTATUS EvtD0Exit(_In_ WDFDEVICE Device, _In_ WDF_POWER_DEVICE_STATE Tar
 {
     PNIC_DEVICE N = GetNic(Device);
     UNREFERENCED_PARAMETER(Target);
+    N->Polling = FALSE;
     WdfTimerStop(N->LinkTimer, TRUE);
     if (N->Gem) {
         P(N, GEM_IDR, 0xFFFFFFFF);
@@ -969,11 +987,11 @@ static NTSTATUS EvtDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT Devi
     IC.AutomaticSerialization = FALSE;
     STEP(3, WdfInterruptCreate(Device, &IC, WDF_NO_OBJECT_ATTRIBUTES, &N->Interrupt));
 
-    WDF_TIMER_CONFIG_INIT_PERIODIC(&TC, EvtLinkTimer, 1000);
+    WDF_TIMER_CONFIG_INIT(&TC, EvtLinkTimer);      /* one-shot, re-armed by the callback */
     TC.AutomaticSerialization = FALSE;
     WDF_OBJECT_ATTRIBUTES_INIT(&TA);
     TA.ParentObject = Device;
-    TA.ExecutionLevel = WdfExecutionLevelDispatch;   /* passive + periodic is not supported (0xC00000BB) */
+    TA.ExecutionLevel = WdfExecutionLevelPassive;    /* needed for registry/MDIO access; passive + periodic is NOT supported (0xC00000BB), so the timer is one-shot */
     STEP(4, WdfTimerCreate(&TC, &TA, &N->LinkTimer));
 
     AI = NetAdapterInitAllocate(Device);
