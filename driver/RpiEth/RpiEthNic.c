@@ -168,6 +168,8 @@ typedef struct _NIC_DEVICE {
     ULONG  NoDma;       /* registry NoDma: 0/2 = copy model (DMA enabler + driver-owned rings and buffers, non-DMA caps), 1 = no DMA objects at all (null data path) */
     ULONG  Bisect;      /* registry Bisect: 1 = skip MAC speed write on link-up, 2 = never publish link-up to Windows */
     ULONG  Dma32;       /* registry Dma32 (default 1): keep every driver DMA buffer below 4 GB */
+    volatile LONG CntRxZero, CntRxFF, CntRxOther;   /* RX frame content probe: first 6 bytes all 0 / all FF / other */
+    ULONG  RxSampleW[12], RxSampleCtrl, RxSampleAddr, RxSampleAddrHi; volatile LONG RxSampleSet;
     ULONG  PollSec;     /* registry PollSec: link poll interval in seconds, 0 = no polling (link forced up at 1000/full) */
     volatile LONG CntTxStart, CntRxStart, CntTxPosted, CntTxDone, CntRxDone;  /* data-path counters, published by the link timer */
     volatile LONG Crumb;   /* stop-path breadcrumbs: 1 RxStop 2 RxCancel 4 TxStop 8 TxCancel 0x10 D0Exit 0x20 timer stopped 0x40 D0Exit done 0x80 ReleaseHw */
@@ -426,7 +428,21 @@ static VOID EvtLinkTimer(_In_ WDFTIMER Timer)
         TRACEVAL(L"GemTbqph", G(N, GEM_TBQPH));
         TRACEVAL(L"GemIsr", G(N, GEM_ISR));
     }
+    TRACEVAL(L"RxZero", N->CntRxZero);
+    TRACEVAL(L"RxFF", N->CntRxFF);
+    TRACEVAL(L"RxOther", N->CntRxOther);
+    if (N->RxSampleSet) {
+        TRACEVAL(L"RxS_Ctrl", N->RxSampleCtrl);
+        TRACEVAL(L"RxS_Addr", N->RxSampleAddr);
+        TRACEVAL(L"RxS_AddrHi", N->RxSampleAddrHi);
+        TRACEVAL(L"RxS_W0", N->RxSampleW[0]);  TRACEVAL(L"RxS_W1", N->RxSampleW[1]);
+        TRACEVAL(L"RxS_W2", N->RxSampleW[2]);  TRACEVAL(L"RxS_W3", N->RxSampleW[3]);
+        TRACEVAL(L"RxS_W4", N->RxSampleW[4]);  TRACEVAL(L"RxS_W5", N->RxSampleW[5]);
+    }
     if (N->TxRing) {
+        TRACEVAL(L"TxD1Addr", N->TxRing[1].Addr);
+        TRACEVAL(L"TxD1Ctrl", N->TxRing[1].Ctrl);
+        TRACEVAL(L"TxD0AddrHi", N->TxRing[0].AddrHi);
         TRACEVAL(L"TxD0Addr", N->TxRing[0].Addr);
         TRACEVAL(L"TxD0Ctrl", N->TxRing[0].Ctrl);
         TRACEVAL(L"TxPost", N->TxPost);
@@ -582,6 +598,19 @@ static VOID EvtRxAdvance(_In_ NETPACKETQUEUE Q)
         Pk = NetRingGetPacketAtIndex(PR, pi);
         Va = NetExtensionGetFragmentVirtualAddress(&C->VaExt, fi);
 
+        {
+            PUCHAR Fr = N->RxPool + (SIZE_T)(N->RxClean % RING_SIZE) * RX_BUF_SIZE;
+            ULONG k, Z = 0, FF = 0;
+            for (k = 0; k < 6; k++) { if (Fr[k] == 0) Z++; if (Fr[k] == 0xFF) FF++; }
+            if (Z == 6) InterlockedIncrement(&N->CntRxZero);
+            else if (FF == 6) InterlockedIncrement(&N->CntRxFF);
+            else InterlockedIncrement(&N->CntRxOther);
+            if (!N->RxSampleSet && Len >= 48) {
+                RtlCopyMemory(N->RxSampleW, Fr, sizeof(N->RxSampleW));
+                N->RxSampleCtrl = Ctrl; N->RxSampleAddr = D->Addr; N->RxSampleAddrHi = D->AddrHi;
+                N->RxSampleSet = 1;
+            }
+        }
         if ((Ctrl & (RXD_SOF | RXD_EOF)) == (RXD_SOF | RXD_EOF) && Len != 0 &&
             Len <= RX_BUF_SIZE && Len <= F->Capacity && Va && Va->VirtualAddress) {
             RtlCopyMemory((PUCHAR)Va->VirtualAddress,
