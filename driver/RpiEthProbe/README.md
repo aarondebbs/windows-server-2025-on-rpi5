@@ -1,4 +1,6 @@
-# RpiEthProbe - build and test notes (UNTESTED)
+# RpiEthProbe - build and test notes
+
+> **Superseded** by the full driver in `../RpiEth` (`RpiEthNic`), which now works. This probe is kept for reference; uninstall it before installing `RpiEthNic`.
 
 Probe driver for the Pi 5 RP1 Ethernet MAC. It only maps the registers, reads
 the GEM module ID and the PHY ID, and stores them in the registry.

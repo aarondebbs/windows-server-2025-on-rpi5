@@ -1,16 +1,13 @@
 /*
- * RpiEthNic - EXPERIMENTAL NetAdapterCx driver for the Raspberry Pi 5 RP1
- * Ethernet MAC (Cadence GEM + Broadcom BCM54213PE PHY), ACPI\RPIE0001.
+ * RpiEthNic - NetAdapterCx driver for the Raspberry Pi 5 RP1 Ethernet MAC
+ * (Cadence GEM + Broadcom BCM54213PE PHY), ACPI\RPIE0001.
  *
- * STATUS: written from the Raspberry Pi Linux macb driver and Microsoft's
- * NetAdapterCx documentation/sample. It has NEVER been compiled against the
- * WDK or run on hardware. Expect compile errors to fix first.
+ * STATUS: link, receive, transmit and DHCP work on hardware (test-signed
+ * build). The bring-up diagnostics are still in the code and will be removed.
+ * Written from the Raspberry Pi Linux macb driver; see DESIGN.md for what
+ * was learned (NCFGR data bus width, GEM_AMP AXI pipeline, copy data path).
  *
- * Known open questions (see DESIGN.md):
- *  - DMA address the RP1 must be given (registry "DmaAddrOffset" is added to
- *    every address programmed into the GEM; default 0).
- *  - TX clock rate for 10/100 Mbit (default: advertise gigabit only).
- *  - Cache coherency of the RP1 DMA path.
+ * Still to do: receive filter / multicast, 10/100 TX clock, offloads.
  */
 
 #include <ntddk.h>

@@ -138,7 +138,7 @@ wpeutil reboot
 
 ## Expected limitations
 
-- No onboard Ethernet: use a USB Ethernet adapter with an in-box Windows driver.
+- Onboard Ethernet needs the patched firmware and the `RpiEthNic` driver (test-signing mode); see the main README. Until it is installed, use a USB Ethernet adapter with an in-box Windows driver.
 - No GPU driver: Microsoft Basic Display Adapter only.
 - No fan control: use a heatsink and fan.
 - The ARM64 Server previews are time-limited and expired builds may nag or restart.

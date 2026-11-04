@@ -27,10 +27,21 @@ drivers/clk/clk-rp1.c, drivers/net/ethernet/cadence/macb_main.c
 - Linux sets rates via assigned-clocks, so the defaults left by the
   bootloader cannot be assumed. NOT yet implemented in firmware.
 
-## Still missing in firmware (untested territory)
-1. Program clk_eth to 125 MHz (gigabit; macb driver changes it per link speed:
-   125 / 25 / 2.5 MHz) and clk_eth_tsu to 50 MHz, then enable both.
-2. Release the Ethernet block from reset (RP1 resets block at offset 0x14000).
-3. Pulse RP1 GPIO 32 low for >= 5 ms to reset the PHY (needs RP1 GPIO/pad setup).
-4. Check what RP1_ETH_CFG_BASE (0x104000) controls; Linux's macb code does not
-   touch it directly, so its role (RGMII/clock config) needs the RP1 datasheet.
+## Findings on real hardware (2026-11-04)
+The list of "missing firmware work" that stood here turned out mostly unnecessary:
+- The Pi boot code had already enabled the Ethernet clocks (clk_eth ctrl read
+  0x10000800, enabled, div_int 1) and pads. The firmware needs no clock code.
+- The ETH block did not need a reset release for link and data to work.
+- The PHY only answers after the RP1 pad for GPIO 32 has its output-disable bit
+  cleared and the reset line is pulsed. The driver does this at D0 entry.
+- clk_eth_tsu (0x134) is not enabled by the boot code. The driver enables it
+  (registry `TsuClk`, default 1); whether it is strictly needed is not proven.
+- The GEM needs `NCFGR.DBW` set from `DCFG1.DBWDEF` (128-bit bus here) and the
+  AXI pipeline values in `GEM_AMP` (0x54). Without them transmit never worked;
+  see driver/RpiEth/DESIGN.md.
+
+## Still unknown
+1. What RP1_ETH_CFG_BASE (0x104000) controls; Linux's macb code does not touch
+   it directly.
+2. The clk_eth rate needed for 10/100 Mbit/s (Linux changes it per speed:
+   125 / 25 / 2.5 MHz); only 1 Gbit/s is verified.
