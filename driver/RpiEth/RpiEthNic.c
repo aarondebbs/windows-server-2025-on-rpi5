@@ -417,6 +417,26 @@ static VOID EvtLinkTimer(_In_ WDFTIMER Timer)
         TRACEVAL(L"GemNcr", G(N, GEM_NCR));
         TRACEVAL(L"GemTsr", G(N, GEM_TSR));
         TRACEVAL(L"GemRsr", G(N, GEM_RSR));
+        TRACEVAL(L"GemNcfgr", G(N, GEM_NCFGR));
+        TRACEVAL(L"GemNsr", G(N, GEM_NSR));
+        TRACEVAL(L"GemDmacfg", G(N, GEM_DMACFG));
+        TRACEVAL(L"GemUsrio", G(N, GEM_USRIO));
+        TRACEVAL(L"GemTbqp", G(N, GEM_TBQP));
+        TRACEVAL(L"GemTbqph", G(N, GEM_TBQPH));
+        TRACEVAL(L"GemIsr", G(N, GEM_ISR));
+    }
+    if (N->TxRing) {
+        TRACEVAL(L"TxD0Addr", N->TxRing[0].Addr);
+        TRACEVAL(L"TxD0Ctrl", N->TxRing[0].Ctrl);
+        TRACEVAL(L"TxPost", N->TxPost);
+        TRACEVAL(L"TxClean", N->TxClean);
+        TRACEVAL(L"TxRingLaLo", (ULONG)N->TxRingLa);
+        TRACEVAL(L"TxPoolLaLo", (ULONG)N->TxPoolLa);
+    }
+    if (N->Clk && N->ClkLen > 0x70) {
+        TRACEVAL(L"ClkEth64", Rd(N->Clk, 0x64));   /* RP1 clk_eth CTRL */
+        TRACEVAL(L"ClkEth68", Rd(N->Clk, 0x68));   /* DIV */
+        TRACEVAL(L"ClkEth6c", Rd(N->Clk, 0x6C));   /* SEL */
     }
     TRACEVAL(L"PhyBmcr", N->DbgBmcr);
     TRACEVAL(L"PhyBmsr", N->DbgBmsr);
