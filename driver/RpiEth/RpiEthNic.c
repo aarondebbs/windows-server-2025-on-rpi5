@@ -431,6 +431,8 @@ static VOID EvtLinkTimer(_In_ WDFTIMER Timer)
         if (!(N->Bisect & 2)) PublishLink(N, Up, Mbps, Full);
         TRACEVAL(L"LinkStage", 2);          /* reached after telling Windows */
     }
+    if (N->LinkUp && !(N->Bisect & 2) && (N->PollCount % 5) == 0)
+        PublishLink(N, TRUE, N->LinkMbps, TRUE);    /* re-announce in case Windows missed the first one */
     TraceFlush();                                 /* one flush per second so the values survive a hang */
     if (N->Polling) WdfTimerStart(Timer, WDF_REL_TIMEOUT_IN_SEC(N->PollSec ? N->PollSec : 1));
 }
