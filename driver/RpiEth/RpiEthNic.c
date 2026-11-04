@@ -206,7 +206,7 @@ static VOID TraceVal(PCUNICODE_STRING Name, ULONG Value)
     if (NT_SUCCESS(WdfDriverOpenParametersRegistryKey(WdfGetDriver(), KEY_SET_VALUE,
                                                       WDF_NO_OBJECT_ATTRIBUTES, &Key))) {
         (VOID)WdfRegistryAssignULong(Key, Name, Value);
-        (VOID)ZwFlushKey(WdfRegistryGetHandle(Key));
+        (VOID)ZwFlushKey(WdfRegistryWdmGetHandle(Key));
         WdfRegistryClose(Key);
     }
 }
