@@ -413,7 +413,8 @@ static BOOLEAN EvtIsr(_In_ WDFINTERRUPT Interrupt, _In_ ULONG MessageID)
     UNREFERENCED_PARAMETER(MessageID);
 
     if (N->Gem == NULL) return FALSE;
-    S = G(N, GEM_ISR);                         /* clear-on-read */
+    S = G(N, GEM_ISR);
+    if (S) P(N, GEM_ISR, S);                   /* DCFG1.IRQCOR==0 on this GEM: status clears on WRITE-1, not on read */
     if (!(S & INT_ALL_DATA)) return FALSE;
     P(N, GEM_IDR, INT_ALL_DATA);               /* mask until the queues re-arm */
     InterlockedOr((volatile LONG *)&N->PendingStatus, (LONG)S);
@@ -933,6 +934,7 @@ static NTSTATUS EvtD0Entry(_In_ WDFDEVICE Device, _In_ WDF_POWER_DEVICE_STATE Pr
     UNREFERENCED_PARAMETER(Prev);
 
     P(N, GEM_IDR, 0xFFFFFFFF);
+    P(N, GEM_ISR, 0xFFFFFFFF);                 /* drop stale status (write-1-to-clear) */
     P(N, GEM_NCR, 0);
     P(N, GEM_NCR, NCR_CLRSTAT);
     P(N, GEM_USRIO, USRIO_RGMII);
