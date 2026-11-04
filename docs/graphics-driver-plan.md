@@ -56,6 +56,30 @@ firmware does the mode setting and scanout. The same UEFI driver can switch betw
 resolutions this way. So **mode setting through the firmware is a known-working path on this
 board**, and that is what makes a modest first stage possible.
 
+## 3b. What would actually make the desktop feel better
+
+The stated goal is a better desktop experience on a server (no games). That changes the priorities:
+
+- **Right now the desktop is drawn by the CPU.** With no GPU driver, Windows uses its software
+  renderer (WARP) for the desktop compositor and hands the finished frames to the display
+  driver. Microsoft Basic Display Adapter is itself a display-only driver, so **a new
+  display-only driver (Stage 1) is not faster by itself.**
+- **Real acceleration of the desktop** needs a full WDDM render driver plus a Direct3D
+  user-mode driver for the V3D GPU. A Vulkan driver (Stage 3) does not accelerate the Windows
+  desktop. That full driver is a research-level project, not a next step.
+- **Where a driver can help without a GPU:** if the slow part is *getting frames to the
+  screen* (framebuffer mapped uncached, byte-wise copies, whole-screen copies instead of changed
+  rectangles), a custom display-only driver with a write-combined mapping and efficient
+  partial-update copies could give a real gain. This is plausible but unproven; it needs
+  measurement first.
+- **Things that need no driver and should be checked first:** the CPU may be running slower than
+  it should (Windows reports about 0.25 GHz; unconfirmed whether that is real), the power plan,
+  Windows visual effects, and the console resolution (a 4K framebuffer is about 33 MB per frame).
+  Remote Desktop from another PC avoids the local console entirely.
+
+So the order is: measure what is slow, fix the cheap things, then decide between the optimised
+display-only driver and anything bigger. The stages below stay as the long-term map.
+
 ## 4. The plan
 
 Each stage is useful on its own, and each decision point depends on data from the previous one.
@@ -81,7 +105,8 @@ Microsoft Basic Display Adapter:
 
 What you get: proper resolution choice and a real display adapter in Device Manager, with
 no HVS/HDMI programming. What you don't get: acceleration, a second display, or independence
-from the firmware.
+from the firmware. **It is not faster than Basic Display Adapter by itself**; any speed gain
+would come from how the driver maps and copies into the framebuffer (see 3b).
 
 **Open questions the probe answers:** does the mailbox work from Windows; can the firmware
 still allocate a new framebuffer after the OS has taken over; is the new framebuffer memory

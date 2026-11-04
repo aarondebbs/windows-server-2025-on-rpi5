@@ -108,7 +108,7 @@ The Pi 5 has a VideoCore VII GPU (V3D 7.1) and a separate display pipeline (HVS,
 | Stage | Goal | Status |
 |---|---|:---:|
 | 0. Probe | [`RpiGpuProbe`](driver/RpiGpuProbe) + [`gpu-acpi.patch`](firmware/gpu-acpi.patch): can Windows reach the firmware mailbox, the PM block and V3D? Reads framebuffer, EDID and clock state. | 🚧 |
-| 1. Firmware-assisted display driver | A WDDM display-only driver that takes over the screen and changes resolution through the VideoCore firmware (the way the Pi 5 UEFI driver does) | 📅 |
+| 1. Firmware-assisted display driver | A WDDM display-only driver that takes over the screen and changes resolution through the VideoCore firmware (the way the Pi 5 UEFI driver does). Not faster than Basic Display by itself; gains would come from how it copies frames to the screen | 📅 |
 | 2. Native display pipeline | Mode setting without the firmware: HVS, pixel valves, HDMI, second display | 📅 |
 | 3. 3D (V3D) | Kernel job submission and a Vulkan driver (Mesa `v3dv` port). Desktop-wide acceleration would need a separate, much larger WDDM render driver | 📅 |
 
