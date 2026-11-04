@@ -39,6 +39,9 @@
 #define GEM_SA1T        0x09C
 #define GEM_USRIO       0x0C0
 #define GEM_MID         0x0FC
+#define GEM_DCFG1       0x280
+#define GEM_DCFG6       0x294
+#define DCFG6_DAW64     (1UL << 23)   /* 64-bit DMA addressing supported */
 #define GEM_TBQPH       0x4C8
 #define GEM_RBQPH       0x4D4
 
@@ -150,6 +153,8 @@ typedef struct _NIC_DEVICE {
     ULONG RxPost, RxClean;
 
     UINT64 DmaOffset;
+    BOOLEAN Addr64;     /* GEM supports 64-bit descriptors (DCFG6.DAW64) */
+    ULONG  DescStride;  /* 16 (64-bit) or 8 (32-bit) bytes per descriptor */
     ULONG  OnlyGigabit;
     ULONG  DataPath;      /* 0 = link only (no DMA engines), 1 = full data path */
     UCHAR  Mac[6];
@@ -402,10 +407,19 @@ static VOID EvtDpc(_In_ WDFINTERRUPT Interrupt, _In_ WDFOBJECT Obj)
 /* ------------------------------------------------------------------ */
 /* Address helpers                                                    */
 /* ------------------------------------------------------------------ */
+static GEM_DESC *RxD(PNIC_DEVICE N, ULONG i)
+{
+    return (GEM_DESC *)((PUCHAR)N->RxRing + (i % RING_SIZE) * N->DescStride);
+}
+static GEM_DESC *TxD(PNIC_DEVICE N, ULONG i)
+{
+    return (GEM_DESC *)((PUCHAR)N->TxRing + (i % RING_SIZE) * N->DescStride);
+}
+
 static VOID SetDescAddr(PNIC_DEVICE N, GEM_DESC *D, UINT64 La, ULONG Flags)
 {
     UINT64 A = La + N->DmaOffset;
-    D->AddrHi = (ULONG)(A >> 32);
+    if (N->Addr64) D->AddrHi = (ULONG)(A >> 32);   /* never write it in 32-bit mode: it aliases the next descriptor */
     D->Ctrl = 0;
     KeMemoryBarrier();
     D->Addr = (ULONG)(A & 0xFFFFFFFCUL) | Flags;
@@ -421,13 +435,14 @@ static VOID EvtRxStart(_In_ NETPACKETQUEUE Q)
     UINT64 A = N->RxRingLa + N->DmaOffset;
 
     for (i = 0; i < RING_SIZE; i++) {
-        N->RxRing[i].Ctrl = 0;
-        N->RxRing[i].AddrHi = 0;
-        N->RxRing[i].Addr = RXD_USED | (i == RING_SIZE - 1 ? RXD_WRAP : 0);  /* sw owned */
+        GEM_DESC *D = RxD(N, i);
+        D->Ctrl = 0;
+        if (N->Addr64) D->AddrHi = 0;
+        D->Addr = RXD_USED | (i == RING_SIZE - 1 ? RXD_WRAP : 0);  /* sw owned */
     }
     N->RxPost = N->RxClean = 0;
     P(N, GEM_RBQP, (ULONG)A);
-    P(N, GEM_RBQPH, (ULONG)(A >> 32));
+    if (N->Addr64) P(N, GEM_RBQPH, (ULONG)(A >> 32));
     TRACEVAL(L"RxQueueStarted", N->DataPath);
     if (N->DataPath) P(N, GEM_NCR, G(N, GEM_NCR) | NCR_RE);
 }
@@ -450,7 +465,7 @@ static VOID EvtRxAdvance(_In_ NETPACKETQUEUE Q)
 
     /* Indicate received frames. */
     while (fi != fEnd) {
-        GEM_DESC *D = &N->RxRing[N->RxClean % RING_SIZE];
+        GEM_DESC *D = RxD(N, N->RxClean);
         NET_FRAGMENT *F;
         NET_PACKET *Pk;
         ULONG Ctrl;
@@ -481,7 +496,7 @@ static VOID EvtRxAdvance(_In_ NETPACKETQUEUE Q)
     fi = FR->NextIndex;
     fEnd = FR->EndIndex;
     while (fi != fEnd && (N->RxPost - N->RxClean) < RING_SIZE) {
-        GEM_DESC *D = &N->RxRing[N->RxPost % RING_SIZE];
+        GEM_DESC *D = RxD(N, N->RxPost);
         NET_FRAGMENT *F = NetRingGetFragmentAtIndex(FR, fi);
         NET_FRAGMENT_LOGICAL_ADDRESS *LA =
             NetExtensionGetFragmentLogicalAddress(&C->LogAddr, fi);
@@ -527,13 +542,14 @@ static VOID EvtTxStart(_In_ NETPACKETQUEUE Q)
     UINT64 A = N->TxRingLa + N->DmaOffset;
 
     for (i = 0; i < RING_SIZE; i++) {
-        N->TxRing[i].Addr = 0;
-        N->TxRing[i].AddrHi = 0;
-        N->TxRing[i].Ctrl = TXD_USED | (i == RING_SIZE - 1 ? TXD_WRAP : 0);
+        GEM_DESC *D = TxD(N, i);
+        D->Addr = 0;
+        if (N->Addr64) D->AddrHi = 0;
+        D->Ctrl = TXD_USED | (i == RING_SIZE - 1 ? TXD_WRAP : 0);
     }
     N->TxPost = N->TxClean = 0;
     P(N, GEM_TBQP, (ULONG)A);
-    P(N, GEM_TBQPH, (ULONG)(A >> 32));
+    if (N->Addr64) P(N, GEM_TBQPH, (ULONG)(A >> 32));
     TRACEVAL(L"TxQueueStarted", N->DataPath);
     if (N->DataPath) P(N, GEM_NCR, G(N, GEM_NCR) | NCR_TE);
 }
@@ -558,7 +574,7 @@ static VOID EvtTxAdvance(_In_ NETPACKETQUEUE Q)
     while (idx != PR->EndIndex) {
         NET_PACKET *Pk = NetRingGetPacketAtIndex(PR, idx);
         if (!Pk->Ignore) {
-            GEM_DESC *D = &N->TxRing[N->TxPost % RING_SIZE];
+            GEM_DESC *D = TxD(N, N->TxPost);
             NET_FRAGMENT *F;
             NET_FRAGMENT_LOGICAL_ADDRESS *LA;
             UINT64 A;
@@ -569,7 +585,7 @@ static VOID EvtTxAdvance(_In_ NETPACKETQUEUE Q)
             A = LA->LogicalAddress + F->Offset + N->DmaOffset;
 
             D->Addr = (ULONG)A;
-            D->AddrHi = (ULONG)(A >> 32);
+            if (N->Addr64) D->AddrHi = (ULONG)(A >> 32);
             KeMemoryBarrier();
             D->Ctrl = TXD_LEN(F->ValidLength) | TXD_LAST |
                       (((N->TxPost % RING_SIZE) == RING_SIZE - 1) ? TXD_WRAP : 0);
@@ -593,7 +609,7 @@ static VOID EvtTxAdvance(_In_ NETPACKETQUEUE Q)
 
         if (!Pk->Ignore) {
             if (N->TxClean == N->TxPost) break;
-            if (!(N->TxRing[N->TxClean % RING_SIZE].Ctrl & TXD_USED)) break;
+            if (!(TxD(N, N->TxClean)->Ctrl & TXD_USED)) break;
             N->TxClean++;
         }
         f = Pk->FragmentIndex;
@@ -836,7 +852,19 @@ static NTSTATUS EvtPrepareHardware(_In_ WDFDEVICE Device, _In_ WDFCMRESLIST Raw,
     LoadSettings(N);
 
     WdfDeviceSetAlignmentRequirement(Device, FILE_64_BYTE_ALIGNMENT);
-    WDF_DMA_ENABLER_CONFIG_INIT(&DC, WdfDmaProfileScatterGather64, 0x10000);
+    /* Descriptor format: 64-bit only if the GEM says so (DCFG6.DAW64). Wrong
+     * format makes the GEM walk the ring with the wrong stride, so record
+     * what we read and never guess. */
+    {
+        ULONG D6 = G(N, GEM_DCFG6);
+        N->Addr64 = (D6 & DCFG6_DAW64) ? TRUE : FALSE;
+        N->DescStride = N->Addr64 ? 16 : 8;
+        TRACEVAL(L"GemDcfg1", G(N, GEM_DCFG1));
+        TRACEVAL(L"GemDcfg6", D6);
+        TRACEVAL(L"GemAddr64", N->Addr64);
+        TRACEVAL(L"GemModuleIdSeen", G(N, GEM_MID));
+    }
+    WDF_DMA_ENABLER_CONFIG_INIT(&DC, N->Addr64 ? WdfDmaProfileScatterGather64 : WdfDmaProfileScatterGather, 0x10000);
     DC.WdmDmaVersionOverride = 3;
     STEP(13, WdfDmaEnablerCreate(Device, &DC, WDF_NO_OBJECT_ATTRIBUTES, &N->Dma));
     STEP(14, CreateRings(N));
@@ -871,7 +899,7 @@ static NTSTATUS EvtD0Entry(_In_ WDFDEVICE Device, _In_ WDF_POWER_DEVICE_STATE Pr
     P(N, GEM_USRIO, USRIO_RGMII);
     P(N, GEM_NCFGR, NCFGR_CLK_DIV224 | NCFGR_DRFCS | NCFGR_BIG | NCFGR_CAF);
     P(N, GEM_DMACFG, DMACFG_FBLDO16 | DMACFG_RXBMS | DMACFG_TXPBMS |
-                     DMACFG_RXBS(RX_BUF_SIZE / 64) | DMACFG_ADDR64);
+                     DMACFG_RXBS(RX_BUF_SIZE / 64) | (N->Addr64 ? DMACFG_ADDR64 : 0));
     Mac4 = N->Mac[0] | (N->Mac[1] << 8) | (N->Mac[2] << 16) | ((ULONG)N->Mac[3] << 24);
     P(N, GEM_SA1B, Mac4);
     P(N, GEM_SA1T, N->Mac[4] | (N->Mac[5] << 8));
